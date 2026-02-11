@@ -1,4 +1,5 @@
 .venv
-output/
-output/cleaned
+.output
+output
+**/output/
 
