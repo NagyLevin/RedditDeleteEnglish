@@ -1,6 +1,12 @@
 === u/kobakocka POSTS ===
 
 Post:
+  subreddit: r/Nebula
+  title: How to get support?
+  body:
+    [removed]
+
+Post:
   subreddit: r/askhungary
   title: Mitől függ, hogy hány láng ég egy ilyen nyílt égésű gázkazánban?
   body:
@@ -29,10 +35,20 @@ Post:
       Köszi a választ előre is,
 
 Post:
-  subreddit: r/Lille
-  title: Bus from Lille to Beauvais Airport?
+  subreddit: r/Nebula
+  title: Is it okay to watch Nebula on a third party app?
   body:
-    Bonjour, Existe-t-il de bonnes options de transports en commun pour rejoindre l'aéroport de Beauvais ? Je connais le bus Flibco pour Charleroi, mais je n'ai rien trouvé pour Beauvais.
+    [removed]
+
+Post:
+  subreddit: r/CitiesSkylines
+  title: The most direct pedestrian crossing ever. I hope it will fixed to a shorter, pedestrian friendlier way.
+
+Post:
+  subreddit: r/Nebula
+  title: Hoog, why some videos not on Nebula?
+  body:
+    [removed]
 
 Post:
   subreddit: r/askhungary
@@ -61,6 +77,10 @@ Post:
       Az első találati oldalon releváns oldalak helyett olyan szolgáltatók vannak, akik már nem ezzel foglalkoznak, a telefonszámuk sem létezik, vagy olyan hirdet aki már nem keres újabb ügyfelet. (Statisztikailag a 10-ből 2-t sikerült egyáltalán elérni.)
       
       Ti milyen alternatív módon keresnétek a helyemben?
+
+Post:
+  subreddit: r/CitiesSkylines
+  title: Rails should be everywhere?
 
 Post:
   subreddit: r/kiszamolo
@@ -95,6 +115,10 @@ Post:
   title: Navracsics a Partizánon
 
 Post:
+  subreddit: r/TrainPorn
+  title: A memorial of the Hungarian Gold Train
+
+Post:
   subreddit: r/hungary
   title: Kutyapárt és elveszett szavazat
   body:
@@ -120,9 +144,7 @@ Post:
 
 Post:
   subreddit: r/aspergers
-  title: Snowflake guy
+  title: Social Deduction Games (eg. Among us, Bang!)
   body:
-    I usually get called as a snowflake guy. I do not know what they mean. I am not. He is:
-      
-      https://youtu.be/ao2Jfm35XeE
+    [removed]
 

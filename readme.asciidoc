@@ -1,0 +1,129 @@
+= Reddit English Filter
+:toc:
+:toclevels: 2
+
+== Mit csináll a program?
+
+Ez a program Reddit export fájlokból (userpostok és usercommentek) kiszűri és eltávolítja azokat a bejegyzéseket, amelyek nagy arányban angol nyelvűek.
+
+Tipikus felhasználás:
+- magyar fókuszú dataset készítés
+- kevert (HU/EN) exportok tisztítása
+- “többnyire angol” kommentek és posztok eltávolítása
+
+A program a teljes bejegyzés-blokkot törli (nem csak pár sort), ha a bejegyzésre teljesül a feltétel.
+
+== Bemeneti formátum
+
+A program olyan szövegfájlokat vár, amelyekben a bejegyzések blokkokra vannak tördelve, például:
+
+----
+Comment:
+  subreddit: r/...
+  body:
+    ...
+
+Post:
+  subreddit: r/...
+  title: ...
+  body:
+    ...
+----
+
+A bejegyzések kezdete `Comment:` vagy `Post:` sorral jelzett.
+
+== Hogyan dönt a törlésről?
+
+A program minden bejegyzésnél kiszámolja az "angol arányt" (0.00 - 1.00):
+
+- Comment esetén: a `body` szöveget vizsgálja
+- Post esetén: a `title + body` szöveget vizsgálja
+
+Ha `english_ratio >= threshold`, akkor a bejegyzés törlésre jelölt.
+
+Alap threshold: 0.90 (90%), de paraméterrel állítható.
+
+== Telepítés
+
+A script fut Python 3.x alatt.
+
+Opcionális (ajánlott) függőség a pontosabb nyelvfelismeréshez:
+- langdetect
+
+Telepítés:
+----
+pip install -r requirements.txt
+----
+
+== Használat
+
+=== Példa parancs (a képen látható)
+----
+python main.py --inputfolder output --show-deleted --threshold 0.80
+----
+
+Ez a példa:
+- az `output` mappában lévő fájlokat feldolgozza
+- a törölt elemeket folyamatosan kiírja a konzolra
+- 0.80-as threshold-ot használ (80% felett angolnak számít és törli)
+
+== Fontos kapcsolók (CLI argumentumok)
+
+*--inputfolder PATH*::
+Kötelező. Az a mappa, ahol a feldolgozandó export `.txt` fájlok vannak.
+
+*--threshold FLOAT*::
+Törlés, ha `english_ratio >= threshold`.
+Példa: `0.90` = 90% angol felett töröl.
+Alap: `0.90`.
+
+*--show-deleted*::
+Folyamatosan kiírja a konzolra, hogy mit törölt (fájlnév, típus, subreddit, arány, rövid preview).
+
+*--ask*::
+Minden törlésre jelölt bejegyzésnél rákérdez:
+- `y` = törli
+- bármi más = kihagyja
+
+*--dry-run*::
+Nem ír ki fájlokat, csak megmutatja, mit törölne.
+
+*--inplace*::
+A fájlokat helyben módosítja (felülírja). Előtte automatikusan `.bak` mentést készít.
+
+*--outputfolder PATH*::
+Ha nem inplace, akkor ide írja a tisztított fájlokat.
+Ha nincs megadva, alapértelmezés: `<inputfolder>/cleaned`
+
+*--pattern GLOB*::
+Fájlszűrő minta, alapból `*.txt`.
+
+*--recursive*::
+Almappák feldolgozása is.
+
+*--force-heuristic*::
+Ha valamiért nem akarod a `langdetect`-et használni, akkor ezzel kényszeríthető a heurisztikus (stopword + ékezet) becslés.
+
+== Tippek
+
+- Első körben érdemes `--dry-run --show-deleted` módban megnézni, mit törölne.
+- Ha túl sok mindent töröl: emeld a `--threshold` értékét (pl. 0.90 -> 0.95).
+- Ha túl kevés angolt töröl: csökkentsd a threshold-ot (pl. 0.90 -> 0.80).
+- Rövid kommenteknél a nyelvfelismerés bizonytalanabb lehet; ilyenkor hasznos a `--ask`.
+
+== Példák
+
+=== Csak listázás, mit törölne
+----
+python main.py --inputfolder ./exportok --dry-run --show-deleted --threshold 0.90
+----
+
+=== Minden törlés előtt rákérdez
+----
+python main.py --inputfolder ./exportok (vagy output) --ask --show-deleted --threshold 0.90
+----
+
+=== Helyben módosítás (backup készül)
+----
+python main.py --inputfolder ./exportok --inplace --show-deleted --threshold 0.90
+----
