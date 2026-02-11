@@ -108,7 +108,11 @@ def _hu_ratio_heuristic(text: str) -> float:
 
     return max(0.0, min(1.0, hu_assigned / len(words)))
 
-def _lang_ratio_langdetect(text: str, lang_code: str) -> Optional[float]:
+def _lang_prob_ratio_langdetect(text: str, lang_code: str) -> Optional[float]:
+    """
+    Returns expected proportion of words in given language, using langdetect probabilities.
+    Tolerant and much less false-positive prone than: top==lang && prob>=0.70
+    """
     if not _LANGDETECT_AVAILABLE or detect_langs is None:
         return None
 
@@ -116,7 +120,7 @@ def _lang_ratio_langdetect(text: str, lang_code: str) -> Optional[float]:
     if not chunks:
         return 0.0
 
-    lang_words = 0
+    lang_words = 0.0
     total_words = 0
 
     for ch in chunks:
@@ -132,40 +136,46 @@ def _lang_ratio_langdetect(text: str, lang_code: str) -> Optional[float]:
         if not langs:
             continue
 
-        top = langs[0]
-        total_words += wcount
+        p = 0.0
+        for lp in langs:
+            if getattr(lp, "lang", "") == lang_code:
+                p = float(getattr(lp, "prob", 0.0))
+                break
 
-        if getattr(top, "lang", "") == lang_code and getattr(top, "prob", 0.0) >= 0.70:
-            lang_words += wcount
+        total_words += wcount
+        lang_words += p * wcount
 
     if total_words == 0:
         return 0.0
-    return lang_words / total_words
+    return float(lang_words / total_words)
 
 def hungarian_ratio(text: str, force_heuristic: bool = False) -> float:
     text = clean_for_lang(text)
     if not text:
         return 0.0
 
-    if not force_heuristic:
-        r = _lang_ratio_langdetect(text, "hu")
-        if r is not None:
-            return r
+    h = _hu_ratio_heuristic(text)
+    if force_heuristic:
+        return h
 
-    return _hu_ratio_heuristic(text)
+    r = _lang_prob_ratio_langdetect(text, "hu")
+    if r is None:
+        return h
+
+    # Key fix: don't allow langdetect to "zero out" good HU heuristic.
+    return max(h, r)
 
 def english_ratio(text: str, force_heuristic: bool = False) -> float:
-    # kept for non-subreddits mode compatibility (delete mostly EN)
     text = clean_for_lang(text)
     if not text:
         return 0.0
 
     if not force_heuristic:
-        r = _lang_ratio_langdetect(text, "en")
+        r = _lang_prob_ratio_langdetect(text, "en")
         if r is not None:
             return r
 
-    # simple "inverse-ish" heuristic: reuse HU heuristic + EN stopwords
+    # fallback heuristic
     words = tokenize_words(text)
     if not words:
         return 0.0
@@ -177,6 +187,7 @@ def english_ratio(text: str, force_heuristic: bool = False) -> float:
     hu_score = hu_sw + 1.5 * hu_diac
     en_score = en_sw
     unknown = len(words) - (en_sw + hu_sw)
+
     if en_score > hu_score:
         en_assigned = en_score + 0.8 * unknown
     else:
@@ -209,7 +220,7 @@ def unique_backup_path(path: Path) -> Path:
 
 
 # ============================================================
-# MODE 1: "Comment:/Post:" exports (your original format)
+# MODE 1: "Comment:/Post:" exports (user export)
 # ============================================================
 ENTRY_START_RE = re.compile(r"^(Comment|Post)\s*:\s*$")
 FIELD_RE = re.compile(r"^\s{2}([A-Za-z0-9_]+):\s*(.*)$")
@@ -271,7 +282,7 @@ def extract_multiline_field(entry_text: str, field: str) -> str:
         return "\n".join(collected).rstrip()
     return ""
 
-def decide_userexport(entry_type: str, entry_text: str, threshold: float, force_heuristic: bool) -> Decision:
+def decide_userexport(entry_type: str, entry_text: str, threshold_en: float, force_heuristic: bool) -> Decision:
     title = extract_multiline_field(entry_text, "title")
     body = extract_multiline_field(entry_text, "body")
 
@@ -284,12 +295,12 @@ def decide_userexport(entry_type: str, entry_text: str, threshold: float, force_
         return Decision(False, 0.0, make_preview(judge_text), kind=entry_type)
 
     r_en = english_ratio(judge_text, force_heuristic=force_heuristic)
-    return Decision(r_en >= threshold, r_en, make_preview(judge_text), kind=entry_type)
+    return Decision(r_en >= threshold_en, r_en, make_preview(judge_text), kind=entry_type)
 
 def process_file_userexport(
     in_path: Path,
     out_path: Path,
-    threshold: float,
+    threshold_en: float,
     show_deleted: bool,
     ask: bool,
     dry_run: bool,
@@ -311,9 +322,9 @@ def process_file_userexport(
         entry_text = b or ""
         total_entries += 1
 
-        dec = decide_userexport(entry_type, entry_text, threshold, force_heuristic)
-
+        dec = decide_userexport(entry_type, entry_text, threshold_en, force_heuristic)
         do_delete = dec.delete
+
         if do_delete and ask:
             print(f"\n[{in_path.name}] Candidate: {dec.kind} | en_ratio={dec.ratio:.2f}")
             print(f"Preview: {dec.preview}")
@@ -344,9 +355,6 @@ BYLINE_RE = re.compile(r"^by\s+([^:]+):\s*(.*)\s*$")
 BODY_START_RE = re.compile(r"^\s{2}body\s*:\s*$")
 
 def split_posts_subreddit(text: str) -> List[Tuple[str, str]]:
-    """
-    Returns list of segments: ("text", raw) or ("post", raw_post_block)
-    """
     lines = text.splitlines(keepends=True)
     segs: List[Tuple[str, str]] = []
 
@@ -367,7 +375,6 @@ def split_posts_subreddit(text: str) -> List[Tuple[str, str]]:
             cur.append(line)
             continue
 
-        # if a subreddit header appears, close current post (rare, but safe)
         if SUBREDDIT_HEADER_RE.match(line) and line.lstrip() == line and in_post:
             flush()
             in_post = False
@@ -375,8 +382,6 @@ def split_posts_subreddit(text: str) -> List[Tuple[str, str]]:
             continue
 
         cur.append(line)
-
-        # If we are not in_post, keep accumulating text; if in_post, we just keep going until next Post: or header or EOF.
 
     flush()
     return segs
@@ -395,32 +400,22 @@ def split_post_into_pre_and_comments(post_block: str) -> Tuple[str, List[str]]:
     return pre, comments
 
 def extract_subreddit_post_text(pre_block: str) -> str:
-    """
-    pre_block contains:
-      Post:
-      by user: TITLE
-      (optional)  body:
-        ....
-    """
     lines = pre_block.splitlines()
     title = ""
     body_lines: List[str] = []
 
-    # title from by-line
     for l in lines:
         m = BYLINE_RE.match(l.strip())
         if m:
             title = m.group(2).strip()
             break
 
-    # body
     for i, l in enumerate(lines):
         if BODY_START_RE.match(l):
             j = i + 1
             while j < len(lines):
                 if COMMENT_START_RE.match(lines[j]):
                     break
-                # body lines are usually indented 4 spaces
                 bl = lines[j]
                 if bl.startswith("    "):
                     body_lines.append(bl[4:])
@@ -433,14 +428,7 @@ def extract_subreddit_post_text(pre_block: str) -> str:
     return (title + "\n" + body).strip()
 
 def extract_subreddit_comment_text(comment_block: str) -> str:
-    """
-    comment_block:
-      '  comment:\n'
-      '    username: text...\n'
-      '      continuation...\n'
-    """
     lines = comment_block.splitlines()
-    # find first content line after "  comment:"
     content_lines: List[str] = []
     started = False
 
@@ -451,7 +439,6 @@ def extract_subreddit_comment_text(comment_block: str) -> str:
         if not started:
             continue
 
-        # strip indentation (at least 4 spaces usually)
         raw = l
         if raw.startswith("    "):
             raw = raw[4:]
@@ -459,7 +446,6 @@ def extract_subreddit_comment_text(comment_block: str) -> str:
             raw = raw.lstrip()
 
         if not content_lines:
-            # first line often: "user: text"
             if ":" in raw:
                 _, txt = raw.split(":", 1)
                 content_lines.append(txt.strip())
@@ -472,20 +458,48 @@ def extract_subreddit_comment_text(comment_block: str) -> str:
 
 def decide_subreddit_post(pre_block: str, threshold_hu: float, force_heuristic: bool) -> Decision:
     judge_text = extract_subreddit_post_text(pre_block)
-    if not judge_text or judge_text.strip().lower() in {"[removed]", "[deleted]"}:
-        return Decision(False, 0.0, make_preview(judge_text), kind="Post")
+    prev = make_preview(judge_text)
+
+    cleaned = clean_for_lang(judge_text)
+    words = tokenize_words(cleaned)
+
+    # 0 szó (emoji/link/semmi): nyelv-semleges -> maradjon
+    if len(words) == 0:
+        return Decision(False, 1.0, prev, kind="Post")
 
     r_hu = hungarian_ratio(judge_text, force_heuristic=force_heuristic)
-    # Subreddits mode: delete if HU ratio below threshold
-    return Decision(r_hu < threshold_hu, r_hu, make_preview(judge_text), kind="Post")
+
+    # Rövid poszt (<=3 szó): csak akkor töröljük, ha egyértelműen angol
+    if len(words) <= 3:
+        r_en = english_ratio(judge_text, force_heuristic=force_heuristic)
+        if r_en >= 0.80 and r_hu < threshold_hu:
+            return Decision(True, r_hu, prev, kind="Post")
+        return Decision(False, r_hu, prev, kind="Post")
+
+    # Hosszabb: HU arány alapján (subreddits módban: delete if HU < threshold)
+    return Decision(r_hu < threshold_hu, r_hu, prev, kind="Post")
 
 def decide_subreddit_comment(comment_block: str, threshold_hu: float, force_heuristic: bool) -> Decision:
     judge_text = extract_subreddit_comment_text(comment_block)
-    if not judge_text or judge_text.strip().lower() in {"[removed]", "[deleted]"}:
-        return Decision(False, 0.0, make_preview(judge_text), kind="Comment")
+    prev = make_preview(judge_text)
+
+    cleaned = clean_for_lang(judge_text)
+    words = tokenize_words(cleaned)
+
+    # 0 szó (emoji/link/semmi): nyelv-semleges -> maradjon
+    if len(words) == 0:
+        return Decision(False, 1.0, prev, kind="Comment")
 
     r_hu = hungarian_ratio(judge_text, force_heuristic=force_heuristic)
-    return Decision(r_hu < threshold_hu, r_hu, make_preview(judge_text), kind="Comment")
+
+    # Rövid komment (<=3 szó): csak akkor töröljük, ha egyértelműen angol
+    if len(words) <= 3:
+        r_en = english_ratio(judge_text, force_heuristic=force_heuristic)
+        if r_en >= 0.80 and r_hu < threshold_hu:
+            return Decision(True, r_hu, prev, kind="Comment")
+        return Decision(False, r_hu, prev, kind="Comment")
+
+    return Decision(r_hu < threshold_hu, r_hu, prev, kind="Comment")
 
 def process_file_subreddits(
     in_path: Path,
@@ -508,7 +522,6 @@ def process_file_subreddits(
             kept.append(block)
             continue
 
-        # post block
         pre, comments = split_post_into_pre_and_comments(block)
         total += 1
 
@@ -527,10 +540,8 @@ def process_file_subreddits(
                 print(f"[DELETED] {in_path.name} | Post | hu_ratio={post_dec.ratio:.2f} | {post_dec.preview}")
             continue
 
-        # keep post header/body
         kept.append(pre)
 
-        # filter comments inside kept post
         for c in comments:
             total += 1
             c_dec = decide_subreddit_comment(c, threshold_hu, force_heuristic)
@@ -563,7 +574,9 @@ def iter_files(inputfolder: Path, recursive: bool, pattern: str) -> List[Path]:
     return sorted(inputfolder.rglob(pattern) if recursive else inputfolder.glob(pattern))
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="Filter Reddit exports: remove mostly-English entries or keep mostly-HU in subreddit dumps.")
+    p = argparse.ArgumentParser(
+        description="Filter Reddit exports: remove mostly-English entries or keep mostly-HU in subreddit dumps."
+    )
     p.add_argument("-inputfolder", "--inputfolder", required=True, help="Folder that contains exported .txt files.")
     p.add_argument("--pattern", default="*.txt", help="Glob pattern for files (default: *.txt).")
     p.add_argument("--recursive", action="store_true", help="Process subfolders too.")
@@ -582,7 +595,8 @@ def main() -> int:
                    help="Do not use langdetect even if installed (use heuristic only).")
 
     p.add_argument("--subreddits", action="store_true",
-                   help="Enable subreddit-dump mode (=== r/... ===, Post:, comment:). In this mode, --threshold means MIN HU ratio to KEEP (below it -> delete).")
+                   help=("Enable subreddit-dump mode (=== r/... ===, Post:, comment:). "
+                         "In this mode, --threshold means MIN HU ratio to KEEP (below it -> delete)."))
 
     args = p.parse_args()
 
@@ -591,14 +605,17 @@ def main() -> int:
         print(f"ERROR: inputfolder does not exist or not a directory: {in_dir}")
         return 2
 
-    out_dir = in_dir if args.inplace else (Path(args.outputfolder).expanduser().resolve() if args.outputfolder else (in_dir / "cleaned"))
+    out_dir = in_dir if args.inplace else (
+        Path(args.outputfolder).expanduser().resolve()
+        if args.outputfolder else (in_dir / "cleaned")
+    )
 
     files = iter_files(in_dir, args.recursive, args.pattern)
     if not files:
         print(f"No files matched: {in_dir} / {args.pattern}")
         return 0
 
-    detector_info = "langdetect" if (_LANGDETECT_AVAILABLE and not args.force_heuristic) else "heuristic"
+    detector_info = "langdetect(prob)" if (_LANGDETECT_AVAILABLE and not args.force_heuristic) else "heuristic"
     print(f"Detector: {detector_info} | threshold={args.threshold:.2f} | subreddits={args.subreddits}")
     print(f"Files: {len(files)} | mode={'inplace' if args.inplace else 'outputfolder'} | dry_run={args.dry_run}")
 
@@ -627,7 +644,7 @@ def main() -> int:
             total, deleted = process_file_userexport(
                 in_path=f,
                 out_path=out_path,
-                threshold=args.threshold,
+                threshold_en=args.threshold,
                 show_deleted=args.show_deleted,
                 ask=args.ask,
                 dry_run=args.dry_run,
