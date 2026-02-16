@@ -105,3 +105,11 @@ janospal.txt
 jaszbereny.txt
 jobshungary.txt
 jobshungaryoffers.txt
+joghungary.txt
+johirek.txt
+jojozsef.txt
+jokedvet.txt
+jozsibacsikft.txt
+jozsibizarrkalandjai.txt
+karacsonyivasar.txt
+kecskemet.txt
