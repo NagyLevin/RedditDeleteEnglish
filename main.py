@@ -955,9 +955,9 @@ def main() -> int:
     p.add_argument("--subreddits", action="store_true",
                    help="Enable subreddit-dump mode (=== r/... ===, Post:, comment:).")
 
-    p.add_argument("--learn-min-freq", type=int, default=2,
+    p.add_argument("--learn-min-freq", type=int, default=1,
                    help="Learning: only add words that appear at least this many times in the judged text (default: 2).")
-    p.add_argument("--learn-max-len", type=int, default=6,
+    p.add_argument("--learn-max-len", type=int, default=20,
                    help="Learning: only add words up to this length (default: 6).")
 
     args = p.parse_args()
