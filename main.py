@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple, Set
 
-VERSION = "2026-02-16_v7 (double-guard: FORCE prompt if hu/en <= zero_eps even before delete)"
+VERSION = "2026-02-16_v10 (learn-filter: block obvious wrong-language words; HU blocks obvious EN+other; EN blocks obvious HU only; disjoint HU/EN)"
 
 # ============================
 # Optional langdetect
@@ -32,7 +32,7 @@ MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 INLINE_CODE_RE = re.compile(r"`[^`]*`")
 WORD_RE = re.compile(r"[^\W\d_]+", flags=re.UNICODE)  # unicode letters only
 
-# CJK/Hangul/Kana detection
+# CJK/Hangul/Kana detection (used for content deletion decisions)
 CJK_RE = re.compile(r"[\u4E00-\u9FFF\u3400-\u4DBF\u3040-\u30FF\uAC00-\uD7AF]")
 
 
@@ -70,6 +70,7 @@ def has_cjk(text: str) -> bool:
 # Default stopwords (seed)
 # ============================
 HU_DIACRITICS = set("áéíóöőúüűÁÉÍÓÖŐÚÜŰ")
+HU_DIACRITICS_LOWER = set("áéíóöőúüű")
 
 DEFAULT_EN_STOPWORDS = {
     "the","a","an","and","or","but","if","then","else","when","while","for","to","of","in","on","at","by","with",
@@ -96,11 +97,37 @@ STOPWORDS_PATH = Path("stopwords.txt").resolve()
 _STOPWORDS_MTIME: Optional[float] = None
 
 
+# ============================
+# Stopwords: disjoint enforcement + load/save
+# ============================
+def enforce_disjoint(hu: Set[str], en: Set[str], prefer: str = "HU") -> Tuple[Set[str], Set[str]]:
+    """
+    Ensure HU and EN sets are disjoint.
+    If overlap exists, remove it from the non-preferred side.
+    Default: HU wins (overlap removed from EN).
+    """
+    overlap = hu & en
+    if not overlap:
+        return hu, en
+
+    if prefer.upper() == "EN":
+        hu = set(hu)
+        hu.difference_update(overlap)
+    else:
+        en = set(en)
+        en.difference_update(overlap)
+
+    return hu, en
+
+
 def _write_stopwords_file(path: Path, hu: Set[str], en: Set[str]) -> None:
+    hu, en = enforce_disjoint(set(hu), set(en), prefer="HU")
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         f.write("# stopwords.txt\n")
-        f.write("# Format:\n# [HU] then one word per line\n# [EN] then one word per line\n\n")
+        f.write("# Format:\n")
+        f.write("# [HU] then one word per line\n")
+        f.write("# [EN] then one word per line\n\n")
         f.write("[HU]\n")
         for w in sorted(hu):
             f.write(w + "\n")
@@ -114,6 +141,7 @@ def _read_stopwords_file(path: Path) -> Tuple[Set[str], Set[str]]:
     en = set(DEFAULT_EN_STOPWORDS)
 
     if not path.exists():
+        hu, en = enforce_disjoint(hu, en, prefer="HU")
         _write_stopwords_file(path, hu, en)
         return hu, en
 
@@ -129,6 +157,7 @@ def _read_stopwords_file(path: Path) -> Tuple[Set[str], Set[str]]:
         if s.upper() == "[EN]":
             section = "EN"
             continue
+
         w = s.lower()
         if not w:
             continue
@@ -137,6 +166,7 @@ def _read_stopwords_file(path: Path) -> Tuple[Set[str], Set[str]]:
         elif section == "EN":
             en.add(w)
 
+    hu, en = enforce_disjoint(hu, en, prefer="HU")
     return hu, en
 
 
@@ -145,33 +175,157 @@ def reload_stopwords_if_changed(force: bool = False) -> None:
 
     if not STOPWORDS_PATH.exists():
         hu, en = _read_stopwords_file(STOPWORDS_PATH)
-        HU_STOPWORDS, EN_STOPWORDS = hu, en
+        HU_STOPWORDS = hu
+        EN_STOPWORDS = en
         _STOPWORDS_MTIME = STOPWORDS_PATH.stat().st_mtime if STOPWORDS_PATH.exists() else None
         return
 
     mtime = STOPWORDS_PATH.stat().st_mtime
     if force or (_STOPWORDS_MTIME is None) or (mtime != _STOPWORDS_MTIME):
         hu, en = _read_stopwords_file(STOPWORDS_PATH)
-        HU_STOPWORDS, EN_STOPWORDS = hu, en
+        HU_STOPWORDS = hu
+        EN_STOPWORDS = en
         _STOPWORDS_MTIME = mtime
 
 
+# ============================
+# Word-level "obvious language" checks (for learning)
+# ============================
+def _is_basic_latin_letter(ch: str) -> bool:
+    o = ord(ch)
+    return (65 <= o <= 90) or (97 <= o <= 122)  # A-Z or a-z
+
+
+def is_obvious_hu_word(w: str) -> bool:
+    # obvious HU if it has HU diacritics OR already a HU stopword
+    if any(ch in HU_DIACRITICS_LOWER for ch in w):
+        return True
+    # also treat already-known HU stopwords as obvious HU
+    return w in HU_STOPWORDS
+
+
+def is_obvious_en_word(w: str) -> bool:
+    # obvious EN: already-known EN stopword (strong signal)
+    return w in EN_STOPWORDS
+
+
+def is_other_language_word(w: str) -> bool:
+    """
+    'Other language' for HU-learning filter:
+    If a word contains letters that are NOT basic latin [a-zA-Z]
+    and NOT Hungarian diacritics, treat it as 'other'.
+    Examples: ł, ą, č, ř, ñ, Cyrillic, Greek, kana, etc.
+    """
+    for ch in w:
+        if _is_basic_latin_letter(ch):
+            continue
+        if ch in HU_DIACRITICS_LOWER:
+            continue
+        # If it's a letter but not allowed set -> other
+        if ch.isalpha():
+            return True
+    return False
+
+
+def filter_words_for_learning(words: Set[str], target_lang: str) -> Tuple[Set[str], List[Tuple[str, str]]]:
+    """
+    Returns (accepted_words, rejected[(word,reason)]).
+    Rules requested:
+      - HU learning: block obvious EN and other-language words
+      - EN learning: block ONLY obvious HU words (even if user pressed 'n')
+      - Always keep HU/EN disjoint: don't accept if already in opposite set
+    """
+    accepted: Set[str] = set()
+    rejected: List[Tuple[str, str]] = []
+
+    t = target_lang.upper()
+
+    for w in words:
+        if len(w) < 2:
+            continue
+
+        if t == "HU":
+            if w in EN_STOPWORDS:
+                rejected.append((w, "in_en"))
+                continue
+            if is_obvious_en_word(w):
+                rejected.append((w, "obvious_en"))
+                continue
+            if is_other_language_word(w):
+                rejected.append((w, "other_lang"))
+                continue
+            accepted.add(w)
+
+        elif t == "EN":
+            if w in HU_STOPWORDS:
+                rejected.append((w, "in_hu"))
+                continue
+            if is_obvious_hu_word(w):
+                rejected.append((w, "obvious_hu"))
+                continue
+            # IMPORTANT: per your request, we do NOT block other languages here
+            accepted.add(w)
+
+        else:
+            rejected.append((w, "bad_target"))
+            continue
+
+    return accepted, rejected
+
+
 def learn_stopwords_from_text(text: str, lang: str) -> None:
+    """
+    Adds words to HU or EN stopwords with:
+      - disjoint enforcement
+      - learning-time word filter (requested)
+    """
     reload_stopwords_if_changed()
-    words = tokenize_words(clean_for_lang(text))
-    words = [w for w in words if len(w) >= 2]
-    if not words:
+
+    raw_words = tokenize_words(clean_for_lang(text))
+    raw_words = [w for w in raw_words if len(w) >= 2]
+    if not raw_words:
+        return
+
+    new_words = set(raw_words)
+
+    # Filter per requested rules (and disjoint check)
+    accepted, rejected = filter_words_for_learning(new_words, lang)
+
+    if not accepted:
+        # Nothing to add; still ok.
+        if rejected:
+            # small, non-spammy feedback (only when user triggered learning)
+            reasons = {}
+            for _, r in rejected:
+                reasons[r] = reasons.get(r, 0) + 1
+            print(f"[LEARN] {lang.upper()}: 0 added, {len(rejected)} skipped ({', '.join([f'{k}={v}' for k,v in reasons.items()])})")
         return
 
     if lang.upper() == "HU":
-        HU_STOPWORDS.update(words)
+        HU_STOPWORDS.update(accepted)
     elif lang.upper() == "EN":
-        EN_STOPWORDS.update(words)
+        EN_STOPWORDS.update(accepted)
     else:
         return
 
+    # Final safety: disjoint (HU wins)
+    hu, en = enforce_disjoint(HU_STOPWORDS, EN_STOPWORDS, prefer="HU")
+    HU_STOPWORDS.clear()
+    HU_STOPWORDS.update(hu)
+    EN_STOPWORDS.clear()
+    EN_STOPWORDS.update(en)
+
     _write_stopwords_file(STOPWORDS_PATH, HU_STOPWORDS, EN_STOPWORDS)
     reload_stopwords_if_changed(force=True)
+
+    # Optional tiny feedback
+    if rejected:
+        reasons = {}
+        for _, r in rejected:
+            reasons[r] = reasons.get(r, 0) + 1
+        print(f"[LEARN] {lang.upper()}: +{len(accepted)} words, skipped {len(rejected)} ({', '.join([f'{k}={v}' for k,v in reasons.items()])})")
+    else:
+        print(f"[LEARN] {lang.upper()}: +{len(accepted)} words")
 
 
 def stopwords_match_ratios(text: str) -> Tuple[float, float, int]:
@@ -361,7 +515,7 @@ def decide_two_stage(
     r_hu = hungarian_ratio(text, force_heuristic=force_heuristic)
     r_en = english_ratio(text, force_heuristic=force_heuristic)
 
-    # primary ask_zero
+    # FORCE ask_zero when both ~0
     if (r_hu <= zero_eps) and (r_en <= zero_eps):
         return Decision(False, r_hu, r_en, prev, kind, "ask_zero")
 
@@ -387,8 +541,10 @@ def decide_two_stage(
 def handle_prompt(dec: Decision, original_text: str, noask: bool) -> Tuple[bool, str]:
     """
     y => keep + learn HU
-    n/Enter => delete + learn EN
+    j => keep, no learning
+    n/Enter/other => delete + learn EN
     h => delete, no learning
+
     --noask:
       ask_zero => KEEP
       ask => DELETE
@@ -406,19 +562,39 @@ def handle_prompt(dec: Decision, original_text: str, noask: bool) -> Tuple[bool,
     print(f"Kind: {dec.kind} | hu={dec.ratio_hu:.6f} | en={dec.ratio_en:.6f} | reason={dec.reason}")
     print(f"Preview: {dec.preview}")
 
-    ans = input("Döntés? (y=megtart+tanul HU, n=töröl+tanul EN, h=töröl(nincs tanulás)) [y/N/h]: ").strip().lower()
+    ans = input("Döntés? (y=megtart+tanul HU, j=megtart(nincs tanulás), n=töröl+tanul EN, h=töröl(nincs tanulás)) [y/j/N/h]: ").strip().lower()
 
     if ans == "y":
         learn_stopwords_from_text(original_text, "HU")
         return False, "HU"
+    if ans == "j":
+        return False, ""
     if ans == "h":
         return True, ""
     learn_stopwords_from_text(original_text, "EN")
     return True, "EN"
 
 
+def force_ask_if_about_to_delete(
+    delete_flag: bool,
+    dec: Decision,
+    zero_eps: float,
+    noask: bool,
+    judge_text: str,
+) -> bool:
+    """
+    Double-guard:
+    if something would be deleted but hu/en are ~0 => force ask_zero prompt (unless --noask).
+    """
+    if delete_flag and (not noask) and (dec.ratio_hu <= zero_eps) and (dec.ratio_en <= zero_eps):
+        print("\n[FORCE ASK] Törlés előtt: hu/en ~0, ezért most KÖTELEZŐ kérdés (double-guard).")
+        forced = Decision(False, dec.ratio_hu, dec.ratio_en, dec.preview, dec.kind, "ask_zero")
+        delete_flag, _ = handle_prompt(forced, judge_text, noask=noask)
+    return delete_flag
+
+
 # ============================
-# Visited
+# Visited (ROOT visited.txt)
 # ============================
 def load_visited(path: Path) -> Set[str]:
     if not path.exists():
@@ -437,6 +613,145 @@ def append_visited(path: Path, rel_posix: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(rel_posix + "\n")
+
+
+# ============================================================
+# MODE 1: User export ("Comment:" / "Post:")
+# ============================================================
+ENTRY_START_RE = re.compile(r"^(Comment|Post)\s*:\s*$")
+FIELD_RE = re.compile(r"^\s{2}([A-Za-z0-9_]+):\s*(.*)$")
+
+
+def split_segments_userexport(text: str) -> List[Tuple[str, str, Optional[str]]]:
+    lines = text.splitlines(keepends=True)
+    segments: List[Tuple[str, str, Optional[str]]] = []
+
+    cur: List[str] = []
+    cur_type: Optional[str] = None
+
+    for line in lines:
+        if ENTRY_START_RE.match(line) and line.lstrip() == line:
+            if cur:
+                if cur_type is None:
+                    segments.append(("text", "".join(cur), None))
+                else:
+                    segments.append(("entry", cur_type, "".join(cur)))
+                cur = []
+            cur_type = ENTRY_START_RE.match(line).group(1)
+            cur.append(line)
+        else:
+            cur.append(line)
+
+    if cur:
+        if cur_type is None:
+            segments.append(("text", "".join(cur), None))
+        else:
+            segments.append(("entry", cur_type, "".join(cur)))
+
+    return segments
+
+
+def extract_multiline_field(entry_text: str, field: str) -> str:
+    lines = entry_text.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(rf"^\s{{2}}{re.escape(field)}:\s*(.*)$", line)
+        if not m:
+            continue
+
+        rest = m.group(1)
+        if rest.strip():
+            return rest.strip()
+
+        collected: List[str] = []
+        j = i + 1
+        while j < len(lines):
+            l = lines[j]
+            if FIELD_RE.match(l) and l.startswith("  "):
+                break
+            if ENTRY_START_RE.match(l) and l.lstrip() == l:
+                break
+
+            if l.startswith("    "):
+                collected.append(l[4:])
+            else:
+                collected.append(l.lstrip())
+            j += 1
+
+        return "\n".join(collected).rstrip()
+    return ""
+
+
+def process_file_userexport(
+    in_path: Path,
+    out_path: Path,
+    threshold: float,
+    margin: float,
+    stopwords_threshold: float,
+    zero_eps: float,
+    show_deleted: bool,
+    confirm_all_deletions: bool,
+    noask: bool,
+    dry_run: bool,
+    force_heuristic: bool,
+) -> Tuple[int, int]:
+    raw = in_path.read_text(encoding="utf-8", errors="replace")
+    segments = split_segments_userexport(raw)
+
+    kept_parts: List[str] = []
+    total_entries = 0
+    deleted_entries = 0
+
+    for kind, a, b in segments:
+        if kind == "text":
+            kept_parts.append(a)
+            continue
+
+        entry_type = a
+        entry_text = b or ""
+        total_entries += 1
+
+        title = extract_multiline_field(entry_text, "title")
+        body = extract_multiline_field(entry_text, "body")
+        judge_text = (title + "\n" + body).strip() if entry_type == "Post" else body.strip()
+
+        if not judge_text or judge_text.strip().lower() in {"[removed]", "[deleted]"}:
+            kept_parts.append(entry_text)
+            continue
+
+        dec = decide_two_stage(
+            judge_text, threshold, margin, stopwords_threshold, zero_eps, force_heuristic, kind=entry_type
+        )
+
+        if dec.reason in {"ask", "ask_zero"}:
+            do_delete, _ = handle_prompt(dec, judge_text, noask=noask)
+        else:
+            do_delete = dec.reason in {"en", "other", "en_stopwords"}
+
+        do_delete = force_ask_if_about_to_delete(do_delete, dec, zero_eps, noask, judge_text)
+
+        if do_delete and (not noask) and confirm_all_deletions and (dec.reason not in {"ask", "ask_zero"}):
+            print(f"\n[{in_path.name}] Candidate DELETE: {dec.kind} | hu={dec.ratio_hu:.6f} | en={dec.ratio_en:.6f} | reason={dec.reason}")
+            print(f"Preview: {dec.preview}")
+            ans = input("Töröljem? [y/N] ").strip().lower()
+            do_delete = (ans == "y")
+
+        if show_deleted:
+            if (not do_delete) and dec.reason == "hu_stopwords":
+                print(f"[KEPT(stopwords)] {in_path.name} | {dec.kind} | hu={dec.ratio_hu:.6f} | en={dec.ratio_en:.6f} | reason={dec.reason} | {dec.preview}")
+            if do_delete:
+                tag = "DELETED(stopwords)" if dec.reason == "en_stopwords" else "DELETED"
+                print(f"[{tag}] {in_path.name} | {dec.kind} | hu={dec.ratio_hu:.6f} | en={dec.ratio_en:.6f} | reason={dec.reason} | {dec.preview}")
+
+        if do_delete:
+            deleted_entries += 1
+        else:
+            kept_parts.append(entry_text)
+
+    if not dry_run:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text("".join(kept_parts), encoding="utf-8")
+
+    return total_entries, deleted_entries
 
 
 # ============================================================
@@ -533,6 +848,7 @@ def extract_subreddit_comment_text(comment_block: str) -> str:
             continue
 
         raw = l[4:] if l.startswith("    ") else l.lstrip()
+
         if not content_lines:
             if ":" in raw:
                 _, txt = raw.split(":", 1)
@@ -543,14 +859,6 @@ def extract_subreddit_comment_text(comment_block: str) -> str:
             content_lines.append(raw.rstrip())
 
     return "\n".join(content_lines).strip()
-
-
-def unique_backup_path(path: Path) -> Path:
-    base = path.with_suffix(path.suffix + ".bak")
-    if not base.exists():
-        return base
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return path.with_suffix(path.suffix + f".bak_{ts}")
 
 
 def process_file_subreddits(
@@ -587,17 +895,12 @@ def process_file_subreddits(
             post_text, threshold, margin, stopwords_threshold, zero_eps, force_heuristic, kind="Post"
         )
 
-        # initial decision
         if post_dec.reason in {"ask", "ask_zero"}:
             delete_post, _ = handle_prompt(post_dec, post_text, noask=noask)
         else:
             delete_post = post_dec.reason in {"en", "other", "en_stopwords"}
 
-        # !!! SECOND GUARD: if about to delete but hu/en ~0 => FORCE ask (unless --noask)
-        if delete_post and (not noask) and (post_dec.ratio_hu <= zero_eps) and (post_dec.ratio_en <= zero_eps):
-            print("\n[FORCE ASK] Törlés előtt: hu/en ~0, ezért most KÖTELEZŐ kérdés (double-guard).")
-            forced = Decision(False, post_dec.ratio_hu, post_dec.ratio_en, post_dec.preview, "Post", "ask_zero")
-            delete_post, _ = handle_prompt(forced, post_text, noask=noask)
+        delete_post = force_ask_if_about_to_delete(delete_post, post_dec, zero_eps, noask, post_text)
 
         if delete_post and (not noask) and confirm_all_deletions and (post_dec.reason not in {"ask", "ask_zero"}):
             print(f"\n[{in_path.name}] Candidate DELETE: Post | hu={post_dec.ratio_hu:.6f} | en={post_dec.ratio_en:.6f} | reason={post_dec.reason}")
@@ -631,11 +934,7 @@ def process_file_subreddits(
             else:
                 delete_c = c_dec.reason in {"en", "other", "en_stopwords"}
 
-            # second guard for comments too
-            if delete_c and (not noask) and (c_dec.ratio_hu <= zero_eps) and (c_dec.ratio_en <= zero_eps):
-                print("\n[FORCE ASK] Törlés előtt: hu/en ~0, ezért most KÖTELEZŐ kérdés (double-guard).")
-                forced = Decision(False, c_dec.ratio_hu, c_dec.ratio_en, c_dec.preview, "Comment", "ask_zero")
-                delete_c, _ = handle_prompt(forced, c_text, noask=noask)
+            delete_c = force_ask_if_about_to_delete(delete_c, c_dec, zero_eps, noask, c_text)
 
             if delete_c and (not noask) and confirm_all_deletions and (c_dec.reason not in {"ask", "ask_zero"}):
                 print(f"\n[{in_path.name}] Candidate DELETE: Comment | hu={c_dec.ratio_hu:.6f} | en={c_dec.ratio_en:.6f} | reason={c_dec.reason}")
@@ -729,6 +1028,7 @@ def main() -> int:
     )
     print(f"Stopwords file (root): {STOPWORDS_PATH}")
     print(f"Visited file (root): {visited_path} | entries={len(visited)}")
+    print(f"Mode: {'inplace' if args.inplace else 'outputfolder'} | dry_run={args.dry_run} | noask={args.noask}")
 
     files_all = iter_files(in_dir, args.recursive, args.pattern)
 
@@ -746,10 +1046,14 @@ def main() -> int:
 
     grand_total = 0
     grand_deleted = 0
+    processed_files = 0
+    skipped_files = 0
+    failed_files = 0
 
     for f in files:
         rel_posix = f.relative_to(in_dir).as_posix()
         if rel_posix in visited:
+            skipped_files += 1
             print(f"[SKIP visited] {rel_posix}")
             continue
 
@@ -775,19 +1079,36 @@ def main() -> int:
                     force_heuristic=args.force_heuristic,
                 )
             else:
-                raise RuntimeError("This v7 snippet focuses on --subreddits mode. Use your prior userexport handler or ask me to merge it in.")
+                total, deleted = process_file_userexport(
+                    in_path=f,
+                    out_path=out_path,
+                    threshold=args.threshold,
+                    margin=args.margin,
+                    stopwords_threshold=args.stopwords_threshold,
+                    zero_eps=args.zero_eps,
+                    show_deleted=args.show_deleted,
+                    confirm_all_deletions=(args.ask and (not args.noask)),
+                    noask=args.noask,
+                    dry_run=args.dry_run,
+                    force_heuristic=args.force_heuristic,
+                )
 
             grand_total += total
             grand_deleted += deleted
+            processed_files += 1
 
             if not args.dry_run:
                 append_visited(visited_path, rel_posix)
                 visited.add(rel_posix)
 
         except Exception as e:
+            failed_files += 1
             print(f"[ERROR] Failed processing {rel_posix}: {e}")
 
     print("\n--- Summary ---")
+    print(f"Files processed: {processed_files}")
+    print(f"Files skipped (visited): {skipped_files}")
+    print(f"Files failed: {failed_files}")
     print(f"Items total={grand_total}, deleted={grand_deleted}, kept={grand_total - grand_deleted}")
     return 0
 
