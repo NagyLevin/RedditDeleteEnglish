@@ -30,6 +30,8 @@ MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 INLINE_CODE_RE = re.compile(r"`[^`]*`")
 WORD_RE = re.compile(r"[^\W\d_]+", flags=re.UNICODE)  # unicode letters only
 
+# quick "other script" detection (CJK)
+CJK_RE = re.compile(r"[\u4E00-\u9FFF\u3400-\u4DBF\u3040-\u30FF\uAC00-\uD7AF]")
 
 def clean_for_lang(text: str) -> str:
     text = URL_RE.sub(" ", text)
@@ -38,10 +40,8 @@ def clean_for_lang(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-
 def tokenize_words(text: str) -> List[str]:
     return [w.lower() for w in WORD_RE.findall(text)]
-
 
 def split_into_chunks(text: str) -> List[str]:
     chunks: List[str] = []
@@ -55,6 +55,9 @@ def split_into_chunks(text: str) -> List[str]:
             if p:
                 chunks.append(p)
     return chunks
+
+def has_cjk(text: str) -> bool:
+    return bool(CJK_RE.search(text))
 
 
 # ============================
@@ -80,14 +83,11 @@ DEFAULT_HU_STOPWORDS = {
     "meg","rá","le","fel","be","ki","el","át","össze","szét",
 }
 
-# These will be mutable and reloaded from stopwords.txt
 EN_STOPWORDS: Set[str] = set(DEFAULT_EN_STOPWORDS)
 HU_STOPWORDS: Set[str] = set(DEFAULT_HU_STOPWORDS)
 
-# Stopwords file is stored in ROOT (current working directory)
 STOPWORDS_PATH = Path("stopwords.txt").resolve()
 _STOPWORDS_MTIME: Optional[float] = None
-
 
 def _write_stopwords_file(path: Path, hu: Set[str], en: Set[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -103,11 +103,7 @@ def _write_stopwords_file(path: Path, hu: Set[str], en: Set[str]) -> None:
         for w in sorted(en):
             f.write(w + "\n")
 
-
 def _read_stopwords_file(path: Path) -> Tuple[Set[str], Set[str]]:
-    """
-    Returns (hu_set, en_set) from file. If file doesn't exist -> (defaults, defaults)
-    """
     hu = set(DEFAULT_HU_STOPWORDS)
     en = set(DEFAULT_EN_STOPWORDS)
 
@@ -128,7 +124,6 @@ def _read_stopwords_file(path: Path) -> Tuple[Set[str], Set[str]]:
             section = "EN"
             continue
 
-        # word line
         w = s.lower()
         if not w:
             continue
@@ -136,18 +131,10 @@ def _read_stopwords_file(path: Path) -> Tuple[Set[str], Set[str]]:
             hu.add(w)
         elif section == "EN":
             en.add(w)
-        else:
-            # if someone forgets headers, ignore or treat as HU?
-            # We'll ignore to avoid accidental garbage.
-            pass
 
     return hu, en
 
-
 def reload_stopwords_if_changed(force: bool = False) -> None:
-    """
-    Reload HU_STOPWORDS / EN_STOPWORDS if stopwords.txt changed on disk.
-    """
     global HU_STOPWORDS, EN_STOPWORDS, _STOPWORDS_MTIME
 
     if not STOPWORDS_PATH.exists():
@@ -164,17 +151,10 @@ def reload_stopwords_if_changed(force: bool = False) -> None:
         EN_STOPWORDS = en
         _STOPWORDS_MTIME = mtime
 
-
 def learn_stopwords_from_text(text: str, lang: str) -> None:
-    """
-    Adds words from text into HU/EN stopwords, writes to stopwords.txt, and reloads.
-    """
     reload_stopwords_if_changed()
-
     words = tokenize_words(clean_for_lang(text))
-    # filter too-short noise
     words = [w for w in words if len(w) >= 2]
-
     if not words:
         return
 
@@ -220,11 +200,7 @@ def _hu_ratio_heuristic(text: str) -> float:
 
     return max(0.0, min(1.0, hu_assigned / len(words)))
 
-
 def _lang_prob_ratio_langdetect(text: str, lang_code: str) -> Optional[float]:
-    """
-    Returns expected proportion of words in given language, using langdetect probabilities.
-    """
     if not _LANGDETECT_AVAILABLE or detect_langs is None:
         return None
 
@@ -261,6 +237,23 @@ def _lang_prob_ratio_langdetect(text: str, lang_code: str) -> Optional[float]:
         return 0.0
     return float(lang_words / total_words)
 
+def detect_top_lang(text: str) -> Optional[Tuple[str, float]]:
+    """
+    Detect top language on the whole cleaned text (fast). Returns (lang, prob) or None.
+    """
+    if not _LANGDETECT_AVAILABLE or detect_langs is None:
+        return None
+    cleaned = clean_for_lang(text)
+    if not cleaned:
+        return None
+    try:
+        langs = detect_langs(cleaned)
+    except Exception:
+        return None
+    if not langs:
+        return None
+    top = langs[0]
+    return (getattr(top, "lang", ""), float(getattr(top, "prob", 0.0)))
 
 def hungarian_ratio(text: str, force_heuristic: bool = False) -> float:
     reload_stopwords_if_changed()
@@ -276,9 +269,7 @@ def hungarian_ratio(text: str, force_heuristic: bool = False) -> float:
     if r is None:
         return h
 
-    # don't allow langdetect to "zero out" good HU heuristic
     return max(h, r)
-
 
 def english_ratio(text: str, force_heuristic: bool = False) -> float:
     reload_stopwords_if_changed()
@@ -291,7 +282,6 @@ def english_ratio(text: str, force_heuristic: bool = False) -> float:
         if r is not None:
             return r
 
-    # fallback heuristic (EN vs HU stopwords + HU diacritics)
     words = tokenize_words(text)
     if not words:
         return 0.0
@@ -322,14 +312,12 @@ class Decision:
     ratio_en: float
     preview: str
     kind: str
-    reason: str  # "hu", "en", "ask", "keep"
-
+    reason: str  # "hu", "en", "ask", "other", "keep"
 
 def make_preview(s: str, n: int = 140) -> str:
     s = s.strip().replace("\n", " ")
     s = re.sub(r"\s+", " ", s)
     return (s[:n] + "...") if len(s) > n else s
-
 
 def unique_backup_path(path: Path) -> Path:
     base = path.with_suffix(path.suffix + ".bak")
@@ -337,7 +325,6 @@ def unique_backup_path(path: Path) -> Path:
         return base
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     return path.with_suffix(path.suffix + f".bak_{ts}")
-
 
 def decide_two_stage(
     text: str,
@@ -347,18 +334,24 @@ def decide_two_stage(
     kind: str,
 ) -> Decision:
     """
-    Two-stage:
+    Updated behavior:
       - if HU recognized (hu_ratio >= threshold): keep
       - elif EN recognized (en_ratio >= threshold): delete
-      - else if ambiguous (close to threshold within margin): ask
-      - else: keep (safe default)
+      - elif clearly other-language (e.g. CJK, or langdetect top!=hu/en with high prob): delete
+      - elif ambiguous (close to threshold within margin): ask
+      - else: delete (because goal is "keep only HU")
     """
     prev = make_preview(text)
-    words = tokenize_words(clean_for_lang(text))
+    cleaned = clean_for_lang(text)
+    words = tokenize_words(cleaned)
 
-    # emoji/link/empty -> keep
+    # empty/emoji/link only -> keep (neutral)
     if len(words) == 0:
         return Decision(False, 1.0, 0.0, prev, kind, reason="keep")
+
+    # hard rule: CJK script -> other -> delete
+    if has_cjk(cleaned):
+        return Decision(True, 0.0, 0.0, prev, kind, reason="other")
 
     r_hu = hungarian_ratio(text, force_heuristic=force_heuristic)
     if r_hu >= threshold:
@@ -368,13 +361,21 @@ def decide_two_stage(
     if r_en >= threshold:
         return Decision(True, r_hu, r_en, prev, kind, reason="en")
 
+    # If langdetect is available, and it strongly says some other language -> delete
+    if (not force_heuristic):
+        top = detect_top_lang(text)
+        if top is not None:
+            lang, prob = top
+            # treat variants like 'zh-cn' as other too
+            if prob >= 0.70 and lang and (lang != "hu") and (lang != "en"):
+                return Decision(True, r_hu, r_en, prev, kind, reason="other")
+
     # ambiguous = within margin of threshold, but neither crossed it
     if max(r_hu, r_en) >= (threshold - margin):
         return Decision(False, r_hu, r_en, prev, kind, reason="ask")
 
-    # safe default: keep
-    return Decision(False, r_hu, r_en, prev, kind, reason="keep")
-
+    # default: delete non-HU
+    return Decision(True, r_hu, r_en, prev, kind, reason="other")
 
 def handle_ambiguous_prompt(
     dec: Decision,
@@ -382,17 +383,14 @@ def handle_ambiguous_prompt(
     noask: bool,
 ) -> Tuple[bool, str]:
     """
-    Returns (delete?, label_lang) where label_lang is "HU" or "EN" or "".
-
     Ambiguous logic:
       - if --noask: delete (no learning)
       - else ask:
           y => keep, learn HU
-          n (or Enter/other) => delete, learn EN
+          n/Enter/other => delete, learn EN
           h => delete, NO learning
     """
     if noask:
-        # no prompt in noask mode; also no learning
         return True, ""
 
     print("\n[AMBIGUOUS] Not confidently HU or EN (within margin).")
@@ -403,12 +401,8 @@ def handle_ambiguous_prompt(
     if ans == "y":
         learn_stopwords_from_text(original_text, "HU")
         return False, "HU"
-
     if ans == "h":
-        # delete, but do not learn anything from it
         return True, ""
-
-    # default: treat as 'n'
     learn_stopwords_from_text(original_text, "EN")
     return True, "EN"
 
@@ -431,7 +425,6 @@ def load_visited(visited_path: Path) -> Set[str]:
         out.add(s)
     return out
 
-
 def append_visited(visited_path: Path, rel_posix: str) -> None:
     visited_path.parent.mkdir(parents=True, exist_ok=True)
     with visited_path.open("a", encoding="utf-8") as f:
@@ -443,7 +436,6 @@ def append_visited(visited_path: Path, rel_posix: str) -> None:
 # ============================================================
 ENTRY_START_RE = re.compile(r"^(Comment|Post)\s*:\s*$")
 FIELD_RE = re.compile(r"^\s{2}([A-Za-z0-9_]+):\s*(.*)$")
-
 
 def split_segments_userexport(text: str) -> List[Tuple[str, str, Optional[str]]]:
     lines = text.splitlines(keepends=True)
@@ -472,7 +464,6 @@ def split_segments_userexport(text: str) -> List[Tuple[str, str, Optional[str]]]
             segments.append(("entry", cur_type, "".join(cur)))
 
     return segments
-
 
 def extract_multiline_field(entry_text: str, field: str) -> str:
     lines = entry_text.splitlines()
@@ -503,7 +494,6 @@ def extract_multiline_field(entry_text: str, field: str) -> str:
         return "\n".join(collected).rstrip()
     return ""
 
-
 def decide_userexport(
     entry_type: str,
     entry_text: str,
@@ -527,7 +517,6 @@ def decide_userexport(
         kind=entry_type,
     )
     return dec, judge_text
-
 
 def process_file_userexport(
     in_path: Path,
@@ -560,16 +549,15 @@ def process_file_userexport(
 
         do_delete = False
 
-        if dec.reason == "hu" or dec.reason == "keep":
+        if dec.reason in {"hu", "keep"}:
             do_delete = False
-        elif dec.reason == "en":
+        elif dec.reason in {"en", "other"}:
             do_delete = True
         elif dec.reason == "ask":
             do_delete, _ = handle_ambiguous_prompt(dec, judge_text, noask=noask)
 
-        # optional: confirm all deletions (legacy behavior)
         if do_delete and (not noask) and confirm_all_deletions and (dec.reason != "ask"):
-            print(f"\n[{in_path.name}] Candidate DELETE: {dec.kind} | hu_ratio={dec.ratio_hu:.2f} | en_ratio={dec.ratio_en:.2f}")
+            print(f"\n[{in_path.name}] Candidate DELETE: {dec.kind} | hu_ratio={dec.ratio_hu:.2f} | en_ratio={dec.ratio_en:.2f} | reason={dec.reason}")
             print(f"Preview: {dec.preview}")
             ans = input("Delete this entry? [y/N] ").strip().lower()
             do_delete = (ans == "y")
@@ -577,7 +565,7 @@ def process_file_userexport(
         if do_delete:
             deleted_entries += 1
             if show_deleted:
-                print(f"[DELETED] {in_path.name} | {dec.kind} | hu_ratio={dec.ratio_hu:.2f} | en_ratio={dec.ratio_en:.2f} | {dec.preview}")
+                print(f"[DELETED] {in_path.name} | {dec.kind} | hu_ratio={dec.ratio_hu:.2f} | en_ratio={dec.ratio_en:.2f} | reason={dec.reason} | {dec.preview}")
         else:
             kept_parts.append(entry_text)
 
@@ -596,7 +584,6 @@ POST_START_RE = re.compile(r"^Post\s*:\s*$")
 COMMENT_START_RE = re.compile(r"^\s{2}comment\s*:\s*$")
 BYLINE_RE = re.compile(r"^by\s+([^:]+):\s*(.*)\s*$")
 BODY_START_RE = re.compile(r"^\s{2}body\s*:\s*$")
-
 
 def split_posts_subreddit(text: str) -> List[Tuple[str, str]]:
     lines = text.splitlines(keepends=True)
@@ -630,7 +617,6 @@ def split_posts_subreddit(text: str) -> List[Tuple[str, str]]:
     flush()
     return segs
 
-
 def split_post_into_pre_and_comments(post_block: str) -> Tuple[str, List[str]]:
     lines = post_block.splitlines(keepends=True)
     comment_idxs = [i for i, l in enumerate(lines) if COMMENT_START_RE.match(l)]
@@ -643,7 +629,6 @@ def split_post_into_pre_and_comments(post_block: str) -> Tuple[str, List[str]]:
         end = comment_idxs[idx_i + 1] if idx_i + 1 < len(comment_idxs) else len(lines)
         comments.append("".join(lines[start:end]))
     return pre, comments
-
 
 def extract_subreddit_post_text(pre_block: str) -> str:
     lines = pre_block.splitlines()
@@ -670,7 +655,6 @@ def extract_subreddit_post_text(pre_block: str) -> str:
     body = "\n".join(body_lines).rstrip()
     return (title + "\n" + body).strip()
 
-
 def extract_subreddit_comment_text(comment_block: str) -> str:
     lines = comment_block.splitlines()
     content_lines: List[str] = []
@@ -695,7 +679,6 @@ def extract_subreddit_comment_text(comment_block: str) -> str:
             content_lines.append(raw.rstrip())
 
     return "\n".join([x for x in content_lines if x is not None]).strip()
-
 
 def process_file_subreddits(
     in_path: Path,
@@ -722,7 +705,6 @@ def process_file_subreddits(
 
         pre, comments = split_post_into_pre_and_comments(block)
 
-        # --- decide post itself
         total += 1
         post_text = extract_subreddit_post_text(pre)
         post_dec = decide_two_stage(post_text, threshold, margin, force_heuristic, kind="Post")
@@ -730,13 +712,13 @@ def process_file_subreddits(
         delete_post = False
         if post_dec.reason in {"hu", "keep"}:
             delete_post = False
-        elif post_dec.reason == "en":
+        elif post_dec.reason in {"en", "other"}:
             delete_post = True
         elif post_dec.reason == "ask":
             delete_post, _ = handle_ambiguous_prompt(post_dec, post_text, noask=noask)
 
         if delete_post and (not noask) and confirm_all_deletions and (post_dec.reason != "ask"):
-            print(f"\n[{in_path.name}] Candidate DELETE: Post | hu_ratio={post_dec.ratio_hu:.2f} | en_ratio={post_dec.ratio_en:.2f}")
+            print(f"\n[{in_path.name}] Candidate DELETE: Post | hu_ratio={post_dec.ratio_hu:.2f} | en_ratio={post_dec.ratio_en:.2f} | reason={post_dec.reason}")
             print(f"Preview: {post_dec.preview}")
             ans = input("Delete this post (and its comments)? [y/N] ").strip().lower()
             delete_post = (ans == "y")
@@ -744,12 +726,11 @@ def process_file_subreddits(
         if delete_post:
             deleted += 1
             if show_deleted:
-                print(f"[DELETED] {in_path.name} | Post | hu_ratio={post_dec.ratio_hu:.2f} | en_ratio={post_dec.ratio_en:.2f} | {post_dec.preview}")
+                print(f"[DELETED] {in_path.name} | Post | hu_ratio={post_dec.ratio_hu:.2f} | en_ratio={post_dec.ratio_en:.2f} | reason={post_dec.reason} | {post_dec.preview}")
             continue
 
         kept.append(pre)
 
-        # --- decide each comment inside kept post
         for c in comments:
             total += 1
             c_text = extract_subreddit_comment_text(c)
@@ -758,13 +739,13 @@ def process_file_subreddits(
             delete_c = False
             if c_dec.reason in {"hu", "keep"}:
                 delete_c = False
-            elif c_dec.reason == "en":
+            elif c_dec.reason in {"en", "other"}:
                 delete_c = True
             elif c_dec.reason == "ask":
                 delete_c, _ = handle_ambiguous_prompt(c_dec, c_text, noask=noask)
 
             if delete_c and (not noask) and confirm_all_deletions and (c_dec.reason != "ask"):
-                print(f"\n[{in_path.name}] Candidate DELETE: Comment | hu_ratio={c_dec.ratio_hu:.2f} | en_ratio={c_dec.ratio_en:.2f}")
+                print(f"\n[{in_path.name}] Candidate DELETE: Comment | hu_ratio={c_dec.ratio_hu:.2f} | en_ratio={c_dec.ratio_en:.2f} | reason={c_dec.reason}")
                 print(f"Preview: {c_dec.preview}")
                 ans = input("Delete this comment? [y/N] ").strip().lower()
                 delete_c = (ans == "y")
@@ -772,7 +753,7 @@ def process_file_subreddits(
             if delete_c:
                 deleted += 1
                 if show_deleted:
-                    print(f"[DELETED] {in_path.name} | Comment | hu_ratio={c_dec.ratio_hu:.2f} | en_ratio={c_dec.ratio_en:.2f} | {c_dec.preview}")
+                    print(f"[DELETED] {in_path.name} | Comment | hu_ratio={c_dec.ratio_hu:.2f} | en_ratio={c_dec.ratio_en:.2f} | reason={c_dec.reason} | {c_dec.preview}")
             else:
                 kept.append(c)
 
@@ -789,7 +770,6 @@ def process_file_subreddits(
 def iter_files(inputfolder: Path, recursive: bool, pattern: str) -> List[Path]:
     return sorted(inputfolder.rglob(pattern) if recursive else inputfolder.glob(pattern))
 
-
 def is_under(path: Path, parent: Path) -> bool:
     try:
         path.resolve().relative_to(parent.resolve())
@@ -797,18 +777,17 @@ def is_under(path: Path, parent: Path) -> bool:
     except Exception:
         return False
 
-
 def main() -> int:
     p = argparse.ArgumentParser(
-        description="Filter Reddit exports with two-stage HU/EN detection + adaptive stopwords."
+        description="Filter Reddit exports with two-stage HU/EN detection + adaptive stopwords (delete non-HU languages too)."
     )
     p.add_argument("-inputfolder", "--inputfolder", required=True, help="Folder that contains exported .txt files.")
     p.add_argument("--pattern", default="*.txt", help="Glob pattern for files (default: *.txt).")
     p.add_argument("--recursive", action="store_true", help="Process subfolders too.")
 
-    p.add_argument("--threshold", type=float, default=0.80,
-                   help="Language recognition threshold. If HU>=threshold => keep. If EN>=threshold => delete.")
-    p.add_argument("--margin", type=float, default=0.08,
+    p.add_argument("--threshold", type=float, default=0.75,
+                   help="Language recognition threshold. HU>=threshold => keep. EN>=threshold => delete. Else => other/ask.")
+    p.add_argument("--margin", type=float, default=0.10,
                    help="Ambiguous margin. If max(HU,EN) >= threshold-margin but none passes threshold => ask (unless --noask).")
 
     p.add_argument("--show-deleted", action="store_true", help="Print deletions continuously to console.")
@@ -824,11 +803,10 @@ def main() -> int:
     p.add_argument("--subreddits", action="store_true",
                    help="Enable subreddit-dump mode (=== r/... ===, Post:, comment:). Otherwise user-export mode.")
 
-    # prompts
     p.add_argument("--ask", action="store_true",
-                   help="(Optional) Confirm EVERY deletion candidate. Ambiguous asking is handled separately.")
+                   help="Confirm EVERY deletion candidate (besides ambiguous which has its own prompt).")
     p.add_argument("--noask", action="store_true",
-                   help="Disable ALL prompts. Ambiguous entries will be deleted automatically.")
+                   help="Disable ALL prompts. Ambiguous entries will be deleted automatically (no learning).")
 
     args = p.parse_args()
 
@@ -842,11 +820,9 @@ def main() -> int:
         if args.outputfolder else (in_dir / "cleaned")
     )
 
-    # visited in ROOT
     visited_path = Path("visited.txt").resolve()
     visited = load_visited(visited_path)
 
-    # ensure stopwords ready (and show where it is)
     reload_stopwords_if_changed(force=True)
 
     detector_info = "langdetect(prob)" if (_LANGDETECT_AVAILABLE and not args.force_heuristic) else "heuristic"
@@ -859,12 +835,10 @@ def main() -> int:
 
     files: List[Path] = []
     for f in files_all:
-        # exclude root files if inputfolder is root
         if f.resolve() == visited_path:
             continue
         if f.resolve() == STOPWORDS_PATH:
             continue
-        # exclude output folder when it sits inside input (avoid processing generated cleaned files)
         if (not args.inplace) and is_under(f, out_dir):
             continue
         files.append(f)
@@ -925,7 +899,6 @@ def main() -> int:
             grand_deleted += deleted
             processed_files += 1
 
-            # Only mark visited on real writes (not dry-run)
             if not args.dry_run:
                 append_visited(visited_path, rel_posix)
                 visited.add(rel_posix)
@@ -951,7 +924,6 @@ def main() -> int:
         print(f"Stopwords file used (root): {STOPWORDS_PATH}")
 
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

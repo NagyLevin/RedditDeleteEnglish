@@ -5,6 +5,7 @@
 
 [HU]
 a
+aaaeefjnjjhfdsaaaaaaaa
 ahol
 aki
 akik
@@ -15,6 +16,7 @@ amikor
 az
 azt
 be
+cigány
 csak
 de
 el
@@ -22,6 +24,8 @@ engem
 ezt
 fel
 ha
+haklllko
+halo
 hatter
 helyes
 hogy
@@ -71,6 +75,7 @@ szét
 szóval
 tanultam
 te
+terrrikem
 ti
 túl
 tőlem
@@ -85,6 +90,7 @@ veletek
 velünk
 vissza
 volt
+väæāgy
 zsindexre
 át
 én
@@ -92,11 +98,11 @@ zsindexre
 össze
 ő
 ők
-cigány
 
 [EN]
 a
 about
+absolute
 again
 ago
 all
@@ -122,6 +128,7 @@ be
 because
 been
 being
+bigger
 bills
 bird
 borders
@@ -233,6 +240,7 @@ ll
 loose
 lot
 magpie
+manian
 map
 may
 me
@@ -242,6 +250,7 @@ might
 military
 missing
 model
+moe
 mongols
 more
 moscow
@@ -280,6 +289,7 @@ reeeeeee
 related
 returned
 rightful
+ro
 score
 seems
 shall
@@ -341,6 +351,7 @@ whom
 why
 wie
 will
+win
 with
 woman
 wonder
