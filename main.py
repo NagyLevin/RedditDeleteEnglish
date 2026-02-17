@@ -6,9 +6,9 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple, Set, Dict
+from typing import List, Optional, Tuple, Set
 
-VERSION = "2026-02-17_v10 (sentence EN removal + szotar.txt HU/IDEGEN + word prompts)"
+VERSION = "2026-02-17_v13 (create szotar.txt in script root + do NOT delete unknown items; delete only if EN/FOREIGN ratio strong)"
 
 # ============================
 # Optional langdetect
@@ -271,10 +271,6 @@ def detect_top_lang(text: str) -> Optional[Tuple[str, float]]:
 # Hunspell HU score
 # ============================
 def hunspell_hu_ratio(text: str, min_word_len: int = 3) -> Optional[float]:
-    """
-    Returns ratio of words recognized by Hungarian Hunspell dictionary.
-    None if hunspell engine not available.
-    """
     if not _HUNSPELL_AVAILABLE:
         return None
 
@@ -331,7 +327,6 @@ def load_szotar(path: Path) -> Tuple[Set[str], Set[str]]:
         elif section == "FOREIGN":
             foreign.add(w)
         else:
-            # If file starts without header, default HU
             hu.add(w)
 
     return hu, foreign
@@ -357,6 +352,11 @@ class SzotarStore:
         self.path = path
         self.hu, self.foreign = load_szotar(path)
         self._dirty = False
+
+        # IMPORTANT: always create the file in root if it doesn't exist
+        if not self.path.exists():
+            save_szotar(self.path, self.hu, self.foreign)
+            self._dirty = False
 
     def save_if_dirty(self) -> None:
         if self._dirty:
@@ -438,7 +438,7 @@ class Decision:
     hs_hu: float
     preview: str
     kind: str
-    reason: str  # hu_langdetect, hu_hunspell, langdetect_xx, unknown, cjk, keep, ask, ask_zero
+    reason: str  # keep_weak_item, hu_langdetect, hu_hunspell, hu_top, kept_bc_szotar_item, en_strong_item, idegen_list_item, langdetect_xx, cjk
 
 
 def decide_langdetect_then_hunspell(
@@ -446,28 +446,47 @@ def decide_langdetect_then_hunspell(
     ld_hu_threshold: float,
     ld_any_threshold: float,
     hunspell_threshold: float,
-    margin: float,
-    zero_eps: float,
-    min_words: int,
     hunspell_min_word_len: int,
     kind: str,
-    force_heuristic: bool,  # kept for CLI compatibility; no effect here
+    force_heuristic: bool,
+    # EN / foreign delete thresholds
+    en_item_threshold: float,
+    szotar: Optional["SzotarStore"] = None,
+    dict_hu_threshold: float = 0.0,
+    dict_foreign_threshold: float = 999.0,
+    dict_min_word_len: int = 3,
 ) -> Decision:
     prev = make_preview(text)
     cleaned = clean_for_lang(text)
     words = tokenize_words(cleaned)
 
     if not words:
-        return Decision(False, 0.0, "", 0.0, 0.0, prev, kind, "keep")
+        return Decision(False, 0.0, "", 0.0, 0.0, prev, kind, "keep_weak_item")
 
     if has_cjk(cleaned):
         return Decision(True, 0.0, "", 0.0, 0.0, prev, kind, "cjk")
 
+    # --- szotar evidence (item-level) ---
+    dict_hu_ratio = 0.0
+    dict_foreign_ratio = 0.0
+    if szotar is not None:
+        dict_hu_ratio = ratio_in_set(words, szotar.hu, dict_min_word_len)
+        dict_foreign_ratio = ratio_in_set(words, szotar.foreign, dict_min_word_len)
+
+        # DELETE only if IDEGEN ratio is above threshold
+        if dict_foreign_ratio >= dict_foreign_threshold:
+            return Decision(True, 0.0, "", 0.0, 0.0, prev, kind, "idegen_list_item")
+
+        # KEEP if HU ratio is above threshold
+        if dict_hu_ratio >= dict_hu_threshold:
+            return Decision(False, 0.0, "", 0.0, 0.0, prev, kind, "kept_bc_szotar_item")
+
+    # --- langdetect (HU + top) ---
     ld_hu = 0.0
     ld_top_lang = ""
     ld_top_prob = 0.0
 
-    if _LANGDETECT_AVAILABLE and not force_heuristic:
+    if _LANGDETECT_AVAILABLE and (not force_heuristic) and detect_langs is not None:
         r = _lang_prob_ratio_langdetect(cleaned, "hu")
         ld_hu = float(r) if r is not None else 0.0
 
@@ -475,55 +494,36 @@ def decide_langdetect_then_hunspell(
         if top is not None:
             ld_top_lang, ld_top_prob = top
 
+        # KEEP HU if strong
+        if ld_top_lang == "hu" and ld_top_prob >= ld_any_threshold:
+            return Decision(False, ld_hu, ld_top_lang, ld_top_prob, 0.0, prev, kind, "hu_top")
+
         if ld_hu >= ld_hu_threshold:
             return Decision(False, ld_hu, ld_top_lang, ld_top_prob, 0.0, prev, kind, "hu_langdetect")
 
+    # --- hunspell HU ratio ---
     hs = hunspell_hu_ratio(cleaned, min_word_len=hunspell_min_word_len)
     hs_hu = float(hs) if hs is not None else 0.0
 
     if hs is not None and hs_hu >= hunspell_threshold:
         return Decision(False, ld_hu, ld_top_lang, ld_top_prob, hs_hu, prev, kind, "hu_hunspell")
 
-    too_short = len([w for w in words if len(w) >= hunspell_min_word_len]) < min_words
-    if (ld_hu <= zero_eps and hs_hu <= zero_eps) or too_short:
-        return Decision(False, ld_hu, ld_top_lang, ld_top_prob, hs_hu, prev, kind, "ask_zero")
+    # --- EN evidence for item deletion (langdetect) ---
+    en_prob = 0.0
+    if _LANGDETECT_AVAILABLE and (not force_heuristic) and detect_langs is not None:
+        r_en = _lang_prob_ratio_langdetect(cleaned, "en")
+        en_prob = float(r_en) if r_en is not None else 0.0
 
-    near_ld = (ld_hu_threshold - margin) <= ld_hu < ld_hu_threshold
-    near_hs = (hunspell_threshold - margin) <= hs_hu < hunspell_threshold
-    if near_ld or near_hs:
-        return Decision(False, ld_hu, ld_top_lang, ld_top_prob, hs_hu, prev, kind, "ask")
+    # DELETE item ONLY if EN strong OR other language top is strong (ratio-like)
+    if (ld_top_lang == "en" and ld_top_prob >= ld_any_threshold) or (en_prob >= en_item_threshold):
+        return Decision(True, ld_hu, ld_top_lang, ld_top_prob, hs_hu, prev, kind, "en_strong_item")
 
-    if ld_top_lang and ld_top_prob >= ld_any_threshold and ld_top_lang != "hu":
+    if ld_top_lang not in {"", "hu", "en"} and ld_top_prob >= ld_any_threshold:
         return Decision(True, ld_hu, ld_top_lang, ld_top_prob, hs_hu, prev, kind, f"langdetect_{ld_top_lang}")
 
-    return Decision(True, ld_hu, ld_top_lang, ld_top_prob, hs_hu, prev, kind, "unknown")
-
-
-def handle_prompt(dec: Decision, noask: bool) -> bool:
-    """
-    Returns delete? bool
-    --noask:
-      ask_zero => DELETE
-      ask      => DELETE
-    """
-    if noask:
-        return True
-
-    if dec.reason == "ask_zero":
-        print("\n[ASK_ZERO] Nem megbízható / túl rövid / nincs elég bizonyíték -> kézi döntés.")
-    else:
-        print("\n[AMBIGUOUS] Küszöb környéke -> kézi döntés.")
-
-    print(
-        f"Kind: {dec.kind} | ld_hu={dec.ld_hu:.6f} | "
-        f"top={dec.ld_top_lang}:{dec.ld_top_prob:.3f} | hs_hu={dec.hs_hu:.6f} | reason={dec.reason}"
-    )
-    print(f"Preview: {dec.preview}")
-
-    ans = input("Döntés? (y=megtart, n/Enter=töröl) [y/N]: ").strip().lower()
-    if ans == "y":
-        return False
-    return True
+    # IMPORTANT CHANGE:
+    # If nothing is strong enough (HU nor EN/foreign), we KEEP the item.
+    return Decision(False, ld_hu, ld_top_lang, ld_top_prob, hs_hu, prev, kind, "keep_weak_item")
 
 
 # ============================
@@ -568,10 +568,8 @@ def decide_sentence(
 
     hu_ratio = ratio_in_set(words, szotar.hu, dict_min_word_len)
     if hu_ratio >= dict_hu_threshold:
-        # Keep strongly supported by szotar HU list
         return SentDecision(True, "kept_bc_szotar", 0.0, "", 0.0, foreign_ratio, hu_ratio, prev)
 
-    # English detection (langdetect) – best-effort
     en_prob = 0.0
     top_lang = ""
     top_prob = 0.0
@@ -598,11 +596,11 @@ def decide_sentence(
 
 def prompt_keep_ambiguous_sentence(sd: SentDecision, kind: str, noask: bool) -> bool:
     """
-    sd.reason == en_ambiguous_ask -> ask user.
-    y = keep, otherwise delete
+    y = keep, else delete.
+    If --noask, we KEEP (do not delete unless strong).
     """
     if noask:
-        return False
+        return True
 
     print("\n[AMBIGUOUS EN] Küszöb alatt / közelében -> kézi döntés.")
     print(
@@ -623,11 +621,10 @@ def collect_words_to_szotar(
 ) -> None:
     """
     If user kept an ambiguous sentence, optionally collect NEW words.
-    - Only words not in HU/IDEGEN.
-    - Skip words already recognized by HU hunspell (if available).
-    - For each word:
-        - If looks English (EN hunspell or langdetect word) => ask to add to IDEGEN.
-        - Else ask: add to HU? (Enter/y=igen, n=IDEGEN, s=skip)
+    Rules:
+      - only words not in HU/IDEGEN.
+      - if EN detector says English -> DO NOT add (skip).
+      - otherwise ask: HU? Enter/y => HU, n => IDEGEN, s => skip
     """
     if noask:
         return
@@ -638,7 +635,6 @@ def collect_words_to_szotar(
     if not words:
         return
 
-    # unique in order
     seen: Set[str] = set()
     ordered: List[str] = []
     for w in words:
@@ -652,15 +648,13 @@ def collect_words_to_szotar(
         if szotar.contains_any(w):
             continue
 
-        # If HU hunspell knows it, no need to store (it is already "HU enough")
+        # If HU hunspell knows it, no need to store
         if _HUNSPELL_AVAILABLE and hunspell_lookup(w):
             continue
 
+        # If English detector says EN -> skip (do not add)
         if is_probably_english_word(w, en_word_prob=en_word_prob):
-            ans = input(f"'{w}' angolnak tűnik. IDEGEN listába tegyem? (Enter/y=igen, n=nem) [Y/n]: ").strip().lower()
-            if ans in {"", "y"}:
-                szotar.add_foreign(w)
-                changed = True
+            # explicitly skip; no add to HU/IDEGEN
             continue
 
         ans2 = input(f"Új szó: '{w}' | HU szótárba? (Enter/y=igen, n=IDEGEN, s=skip) [Y/n/s]: ").strip().lower()
@@ -671,7 +665,6 @@ def collect_words_to_szotar(
             szotar.add_foreign(w)
             changed = True
         else:
-            # skip
             pass
 
     if changed:
@@ -695,15 +688,6 @@ def filter_text_sentences(
     en_word_prob: float,
     szotar: SzotarStore,
 ) -> str:
-    """
-    Split to sentence-like chunks. Remove:
-      - strong English chunks
-      - chunks dominated by IDEGEN words
-    Keep + print:
-      - chunks dominated by HU szotar words -> print "KEPT, bc szotar.txt"
-    Ask:
-      - near English threshold -> y keeps + triggers word collection.
-    """
     chunks = split_into_chunks(text)
     if not chunks:
         return text
@@ -731,7 +715,6 @@ def filter_text_sentences(
             keep_it = prompt_keep_ambiguous_sentence(sd, kind=f"{file_name} | {context_kind}", noask=noask)
             if keep_it:
                 kept.append(ch)
-                # collect words from this sentence
                 collect_words_to_szotar(
                     ch,
                     szotar=szotar,
@@ -913,12 +896,6 @@ def rewrite_post_pre_block(
     en_word_prob: float,
     szotar: SzotarStore,
 ) -> str:
-    """
-    Rewrite title and body in the pre_block by removing EN/IDEGEN-dominated sentences.
-    Keeps original structure lines; rewrites:
-      - "by X: <title>"
-      - body content lines (under "  body :")
-    """
     lines = pre_block.splitlines(keepends=True)
     out: List[str] = []
     i = 0
@@ -926,7 +903,6 @@ def rewrite_post_pre_block(
     while i < len(lines):
         line = lines[i]
 
-        # byline
         m = BYLINE_RE.match(line.strip())
         if m:
             user = m.group(1)
@@ -952,7 +928,6 @@ def rewrite_post_pre_block(
             i += 1
             continue
 
-        # body
         if BODY_START_RE.match(line):
             out.append(line)
             i += 1
@@ -961,7 +936,6 @@ def rewrite_post_pre_block(
                 body_lines.append(lines[i])
                 i += 1
 
-            # extract raw body text from indented lines
             raw_body_parts: List[str] = []
             for bl in body_lines:
                 txt = bl[4:] if bl.startswith("    ") else bl.lstrip()
@@ -988,7 +962,6 @@ def rewrite_post_pre_block(
             if new_body.strip():
                 for ln in new_body.splitlines():
                     out.append("    " + ln.rstrip() + "\n")
-
             continue
 
         out.append(line)
@@ -1013,16 +986,10 @@ def rewrite_comment_block(
     en_word_prob: float,
     szotar: SzotarStore,
 ) -> Optional[str]:
-    """
-    Rewrite comment text lines by removing EN/IDEGEN-dominated sentences.
-    Tries to preserve "author:" prefix from the first content line.
-    Returns None if comment becomes empty (=> delete the entire comment block).
-    """
     lines = comment_block.splitlines(keepends=True)
     if not lines:
         return comment_block
 
-    # find the comment start line index
     start_idx = None
     for i, l in enumerate(lines):
         if COMMENT_START_RE.match(l):
@@ -1031,15 +998,12 @@ def rewrite_comment_block(
     if start_idx is None:
         return comment_block
 
-    # find first content line after comment:
-    first_content_idx = None
     author_prefix = ""
     for j in range(start_idx + 1, len(lines)):
         raw = lines[j]
         stripped = (raw[4:] if raw.startswith("    ") else raw.lstrip()).rstrip("\n")
         if stripped.strip() == "":
             continue
-        first_content_idx = j
         if ":" in stripped:
             author = stripped.split(":", 1)[0].strip()
             author_prefix = author + ":"
@@ -1067,7 +1031,6 @@ def rewrite_comment_block(
         return None
 
     new_lines: List[str] = []
-    # keep the "  comment :" line (and any lines up to it)
     new_lines.extend(lines[: start_idx + 1])
 
     text_lines = new_text.splitlines()
@@ -1089,16 +1052,12 @@ def process_file_subreddits(
     ld_hu_threshold: float,
     ld_any_threshold: float,
     hunspell_threshold: float,
-    margin: float,
-    zero_eps: float,
-    min_words: int,
     hunspell_min_word_len: int,
     show_deleted: bool,
-    confirm_all_deletions: bool,
     noask: bool,
     dry_run: bool,
     force_heuristic: bool,
-    # NEW: sentence EN/DICT filtering
+    en_item_threshold: float,
     en_sentence_threshold: float,
     dict_foreign_threshold: float,
     dict_hu_threshold: float,
@@ -1121,7 +1080,7 @@ def process_file_subreddits(
 
         pre, comments = split_post_into_pre_and_comments(block)
 
-        # POST (item-level keep/delete)
+        # POST item-level decision (DELETE only if EN/foreign strong)
         total += 1
         post_text = extract_subreddit_post_text(pre)
         post_dec = decide_langdetect_then_hunspell(
@@ -1129,48 +1088,35 @@ def process_file_subreddits(
             ld_hu_threshold=ld_hu_threshold,
             ld_any_threshold=ld_any_threshold,
             hunspell_threshold=hunspell_threshold,
-            margin=margin,
-            zero_eps=zero_eps,
-            min_words=min_words,
             hunspell_min_word_len=hunspell_min_word_len,
             kind="Post",
             force_heuristic=force_heuristic,
+            en_item_threshold=en_item_threshold,
+            szotar=szotar,
+            dict_hu_threshold=dict_hu_threshold,
+            dict_foreign_threshold=dict_foreign_threshold,
+            dict_min_word_len=dict_min_word_len,
         )
 
-        if post_dec.reason in {"ask", "ask_zero"}:
-            delete_post = handle_prompt(post_dec, noask=noask)
-        else:
-            delete_post = post_dec.delete
-
-        if delete_post and (not noask) and confirm_all_deletions and (post_dec.reason not in {"ask", "ask_zero"}):
-            print(
-                f"\n[{in_path.name}] Candidate DELETE: Post | ld_hu={post_dec.ld_hu:.6f} | "
-                f"top={post_dec.ld_top_lang}:{post_dec.ld_top_prob:.3f} | hs_hu={post_dec.hs_hu:.6f} | reason={post_dec.reason}"
-            )
-            print(f"Preview: {post_dec.preview}")
-            ans = input("Töröljem a posztot (kommentekkel együtt)? [y/N] ").strip().lower()
-            delete_post = (ans == "y")
-
         if show_deleted:
-            if delete_post:
+            if post_dec.delete:
                 print(
                     f"[DELETED] {in_path.name} | Post | ld_hu={post_dec.ld_hu:.6f} | "
                     f"top={post_dec.ld_top_lang}:{post_dec.ld_top_prob:.3f} | hs_hu={post_dec.hs_hu:.6f} | "
                     f"reason={post_dec.reason} | {post_dec.preview}"
                 )
             else:
-                if post_dec.reason in {"hu_langdetect", "hu_hunspell"}:
-                    print(
-                        f"[KEPT] {in_path.name} | Post | ld_hu={post_dec.ld_hu:.6f} | "
-                        f"top={post_dec.ld_top_lang}:{post_dec.ld_top_prob:.3f} | hs_hu={post_dec.hs_hu:.6f} | "
-                        f"reason={post_dec.reason} | {post_dec.preview}"
-                    )
+                print(
+                    f"[KEPT] {in_path.name} | Post | ld_hu={post_dec.ld_hu:.6f} | "
+                    f"top={post_dec.ld_top_lang}:{post_dec.ld_top_prob:.3f} | hs_hu={post_dec.hs_hu:.6f} | "
+                    f"reason={post_dec.reason} | {post_dec.preview}"
+                )
 
-        if delete_post:
+        if post_dec.delete:
             deleted += 1
             continue
 
-        # NEW: rewrite title/body inside pre by removing EN/IDEGEN-dominated sentences
+        # sentence-level cleanup inside post
         new_pre = rewrite_post_pre_block(
             pre,
             file_name=in_path.name,
@@ -1178,7 +1124,7 @@ def process_file_subreddits(
             noask=noask,
             ld_any_threshold=ld_any_threshold,
             en_sentence_threshold=en_sentence_threshold,
-            margin=margin,
+            margin=0.10,
             dict_foreign_threshold=dict_foreign_threshold,
             dict_hu_threshold=dict_hu_threshold,
             dict_min_word_len=dict_min_word_len,
@@ -1187,7 +1133,6 @@ def process_file_subreddits(
             szotar=szotar,
         )
 
-        # If post became empty-ish (no title+no body), delete it
         if not extract_subreddit_post_text(new_pre).strip():
             if show_deleted:
                 print(f"[DELETED] {in_path.name} | Post | reason=post_became_empty_after_sentence_filter")
@@ -1205,48 +1150,35 @@ def process_file_subreddits(
                 ld_hu_threshold=ld_hu_threshold,
                 ld_any_threshold=ld_any_threshold,
                 hunspell_threshold=hunspell_threshold,
-                margin=margin,
-                zero_eps=zero_eps,
-                min_words=min_words,
                 hunspell_min_word_len=hunspell_min_word_len,
                 kind="Comment",
                 force_heuristic=force_heuristic,
+                en_item_threshold=en_item_threshold,
+                szotar=szotar,
+                dict_hu_threshold=dict_hu_threshold,
+                dict_foreign_threshold=dict_foreign_threshold,
+                dict_min_word_len=dict_min_word_len,
             )
 
-            if c_dec.reason in {"ask", "ask_zero"}:
-                delete_c = handle_prompt(c_dec, noask=noask)
-            else:
-                delete_c = c_dec.delete
-
-            if delete_c and (not noask) and confirm_all_deletions and (c_dec.reason not in {"ask", "ask_zero"}):
-                print(
-                    f"\n[{in_path.name}] Candidate DELETE: Comment | ld_hu={c_dec.ld_hu:.6f} | "
-                    f"top={c_dec.ld_top_lang}:{c_dec.ld_top_prob:.3f} | hs_hu={c_dec.hs_hu:.6f} | reason={c_dec.reason}"
-                )
-                print(f"Preview: {c_dec.preview}")
-                ans = input("Töröljem a kommentet? [y/N] ").strip().lower()
-                delete_c = (ans == "y")
-
             if show_deleted:
-                if delete_c:
+                if c_dec.delete:
                     print(
                         f"[DELETED] {in_path.name} | Comment | ld_hu={c_dec.ld_hu:.6f} | "
                         f"top={c_dec.ld_top_lang}:{c_dec.ld_top_prob:.3f} | hs_hu={c_dec.hs_hu:.6f} | "
                         f"reason={c_dec.reason} | {c_dec.preview}"
                     )
                 else:
-                    if c_dec.reason in {"hu_langdetect", "hu_hunspell"}:
-                        print(
-                            f"[KEPT] {in_path.name} | Comment | ld_hu={c_dec.ld_hu:.6f} | "
-                            f"top={c_dec.ld_top_lang}:{c_dec.ld_top_prob:.3f} | hs_hu={c_dec.hs_hu:.6f} | "
-                            f"reason={c_dec.reason} | {c_dec.preview}"
-                        )
+                    print(
+                        f"[KEPT] {in_path.name} | Comment | ld_hu={c_dec.ld_hu:.6f} | "
+                        f"top={c_dec.ld_top_lang}:{c_dec.ld_top_prob:.3f} | hs_hu={c_dec.hs_hu:.6f} | "
+                        f"reason={c_dec.reason} | {c_dec.preview}"
+                    )
 
-            if delete_c:
+            if c_dec.delete:
                 deleted += 1
                 continue
 
-            # NEW: rewrite comment by removing EN/IDEGEN-dominated sentences
+            # sentence-level cleanup inside comment
             new_c = rewrite_comment_block(
                 c,
                 file_name=in_path.name,
@@ -1254,7 +1186,7 @@ def process_file_subreddits(
                 noask=noask,
                 ld_any_threshold=ld_any_threshold,
                 en_sentence_threshold=en_sentence_threshold,
-                margin=margin,
+                margin=0.10,
                 dict_foreign_threshold=dict_foreign_threshold,
                 dict_hu_threshold=dict_hu_threshold,
                 dict_min_word_len=dict_min_word_len,
@@ -1278,6 +1210,15 @@ def process_file_subreddits(
 
 
 # ============================
+# Root helpers
+# ============================
+def script_root_dir() -> Path:
+    if "__file__" in globals():
+        return Path(__file__).resolve().parent
+    return Path.cwd().resolve()
+
+
+# ============================
 # File iteration & main
 # ============================
 def iter_files(inputfolder: Path, recursive: bool, pattern: str) -> List[Path]:
@@ -1297,7 +1238,7 @@ def main() -> int:
     _try_init_hunspell_en()
 
     p = argparse.ArgumentParser(
-        description="Filter Reddit exports: keep HU via langdetect, fallback to Hunspell; sentence-level EN removal + szotar HU/IDEGEN."
+        description="Filter Reddit exports: KEEP items unless EN/foreign ratio strong; sentence-level EN removal + szotar HU/IDEGEN."
     )
     p.add_argument("--version", action="version", version=VERSION)
 
@@ -1305,42 +1246,38 @@ def main() -> int:
     p.add_argument("--pattern", default="*.txt", help="Glob pattern for files (default: *.txt).")
     p.add_argument("--recursive", action="store_true", help="Process subfolders too.")
 
-    # Item-level HU thresholds
+    # Item-level HU thresholds (keep)
     p.add_argument("--ld-hu-threshold", "--threshold", dest="ld_hu_threshold", type=float, default=0.70,
                    help="Keep item if langdetect HU probability >= this.")
     p.add_argument("--ld-any-threshold", type=float, default=0.70,
-                   help="If langdetect top prob >= this and not HU, reason will be langdetect_xx.")
+                   help="If langdetect top prob >= this and not HU, it may delete ONLY if >= this.")
     p.add_argument("--hunspell-threshold", dest="hunspell_threshold", type=float, default=0.55,
                    help="Keep item if Hunspell HU word ratio >= this.")
-
-    # Ambiguity handling (item-level)
-    p.add_argument("--margin", type=float, default=0.10, help="Near-threshold band that triggers ask.")
-    p.add_argument("--zero-eps", type=float, default=0.02, help="Near-zero evidence threshold for ask_zero.")
-    p.add_argument("--min-words", type=int, default=4, help="If too few words, treat as ask_zero.")
     p.add_argument("--hunspell-min-word-len", type=int, default=3, help="Ignore shorter words for Hunspell ratio.")
+
+    # Item-level EN delete threshold
+    p.add_argument("--en-item-threshold", type=float, default=0.70,
+                   help="Delete item if EN probability >= this (or top=en>=ld-any-threshold).")
 
     p.add_argument("--show-deleted", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--inplace", action="store_true")
     p.add_argument("--outputfolder", default=None)
-
-    # kept for compatibility
     p.add_argument("--force-heuristic", action="store_true")
-
     p.add_argument("--subreddits", action="store_true")
 
-    p.add_argument("--ask", action="store_true")
     p.add_argument("--noask", action="store_true",
-                   help="Disable ALL prompts. item ask/ask_zero => DELETE; ambiguous EN sentence => DELETE; no szotar collection.")
+                   help="Disable ALL prompts. Ambiguous EN sentence => KEEP; no szotar collection.")
 
-    # NEW: sentence-level EN removal
+    # Sentence-level EN removal
     p.add_argument("--en-sent-threshold", type=float, default=0.70,
                    help="Delete sentence if EN probability >= this (langdetect).")
-    # NEW: szotar thresholds
+
+    # szotar thresholds
     p.add_argument("--szotar-file", type=str, default="szotar.txt",
-                   help="Path to szotar.txt containing [HU] and [IDEGEN] sections.")
+                   help="Path to szotar.txt. If relative, it is resolved relative to the script root (main.py folder).")
     p.add_argument("--dict-foreign-threshold", type=float, default=0.35,
-                   help="Delete sentence if IDEGEN words ratio >= this.")
+                   help="Delete sentence (and item if used item-level) if IDEGEN words ratio >= this.")
     p.add_argument("--dict-hu-threshold", type=float, default=0.35,
                    help="If HU szotar words ratio >= this, print: KEPT, bc szotar.txt.")
     p.add_argument("--dict-min-word-len", type=int, default=1,
@@ -1348,7 +1285,7 @@ def main() -> int:
     p.add_argument("--dict-collect-min-word-len", type=int, default=4,
                    help="Min word length for collecting new words into szotar from kept ambiguous sentences.")
     p.add_argument("--en-word-prob", type=float, default=0.80,
-                   help="If no EN hunspell, langdetect(word) >= this => treat as English word.")
+                   help="If no EN hunspell, langdetect(word) >= this => treat as English word (and SKIP adding).")
 
     args = p.parse_args()
 
@@ -1369,26 +1306,23 @@ def main() -> int:
     hunspell_info = _HUNSPELL_ENGINE_NAME if _HUNSPELL_AVAILABLE else "hunspell(unavailable)"
     hunspell_en_info = _HUNSPELL_EN_ENGINE_NAME if _HUNSPELL_EN_AVAILABLE else "hunspell_en(unavailable)"
 
-    szotar_path = Path(args.szotar_file).expanduser().resolve()
+    # Resolve szotar path relative to script root (main.py folder)
+    root = script_root_dir()
+    raw_szotar = Path(args.szotar_file).expanduser()
+    szotar_path = (root / raw_szotar).resolve() if not raw_szotar.is_absolute() else raw_szotar.resolve()
     szotar = SzotarStore(szotar_path)
 
     print(f"Version: {VERSION}")
     print(
         f"Detectors: {detector_info} -> {hunspell_info} | EN-word: {hunspell_en_info} | "
-        f"ld_hu_threshold={args.ld_hu_threshold:.2f} | hunspell_threshold={args.hunspell_threshold:.2f} | "
-        f"margin={args.margin:.2f} | en_sent_threshold={args.en_sent_threshold:.2f} | "
+        f"ld_hu_threshold={args.ld_hu_threshold:.2f} | ld_any_threshold={args.ld_any_threshold:.2f} | "
+        f"hunspell_threshold={args.hunspell_threshold:.2f} | en_item_threshold={args.en_item_threshold:.2f} | "
+        f"en_sent_threshold={args.en_sent_threshold:.2f} | "
         f"dict_foreign_threshold={args.dict_foreign_threshold:.2f} | dict_hu_threshold={args.dict_hu_threshold:.2f} | "
         f"subreddits={args.subreddits}"
     )
     print(f"Visited file (root): {visited_path} | entries={len(visited)}")
-    print(f"Szotar: {szotar_path} | HU={len(szotar.hu)} | IDEGEN={len(szotar.foreign)}")
-
-    if not _LANGDETECT_AVAILABLE:
-        print("WARN: langdetect not available. Sentence EN detection will be limited.")
-    if not _HUNSPELL_AVAILABLE:
-        print("WARN: HU Hunspell not available. Item-level fallback is disabled (install phunspell or hunspell + hu_HU dict).")
-    if not _HUNSPELL_EN_AVAILABLE:
-        print("INFO: EN Hunspell not available. Word-level EN check falls back to langdetect(word) when possible.")
+    print(f"Szotar (script root): {szotar_path} | exists={szotar_path.exists()} | HU={len(szotar.hu)} | IDEGEN={len(szotar.foreign)}")
 
     files_all = iter_files(in_dir, args.recursive, args.pattern)
 
@@ -1427,15 +1361,12 @@ def main() -> int:
                     ld_hu_threshold=args.ld_hu_threshold,
                     ld_any_threshold=args.ld_any_threshold,
                     hunspell_threshold=args.hunspell_threshold,
-                    margin=args.margin,
-                    zero_eps=args.zero_eps,
-                    min_words=args.min_words,
                     hunspell_min_word_len=args.hunspell_min_word_len,
                     show_deleted=args.show_deleted,
-                    confirm_all_deletions=(args.ask and (not args.noask)),
                     noask=args.noask,
                     dry_run=args.dry_run,
                     force_heuristic=args.force_heuristic,
+                    en_item_threshold=args.en_item_threshold,
                     en_sentence_threshold=args.en_sent_threshold,
                     dict_foreign_threshold=args.dict_foreign_threshold,
                     dict_hu_threshold=args.dict_hu_threshold,
@@ -1445,7 +1376,7 @@ def main() -> int:
                     szotar=szotar,
                 )
             else:
-                raise RuntimeError("This v10 code focuses on --subreddits mode (same as your v9).")
+                raise RuntimeError("This v13 code focuses on --subreddits mode.")
 
             grand_total += total
             grand_deleted += deleted
@@ -1453,8 +1384,6 @@ def main() -> int:
             if not args.dry_run:
                 append_visited(visited_path, rel_posix)
                 visited.add(rel_posix)
-
-                # ensure szotar persisted
                 szotar.save_if_dirty()
 
         except Exception as e:
