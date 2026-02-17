@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple, Set
 
-VERSION = "2026-02-17_v20 (item-level: dict HU/IDEGEN early-exit before detectors; link-dominant delete; single-word szotar-first; manual y/n ALWAYS updates szotar)"
+VERSION = "2026-02-17_v25 (unified word prompt: HU? yes->HU, no->IDEGEN; emoji+links+punct-noise delete)"
 
 # ============================
 # Optional langdetect
@@ -55,7 +55,6 @@ def _find_hunspell_files(lang: str) -> Optional[Tuple[Path, Path]]:
 
 def _try_init_hunspell_hu() -> None:
     global _HUNSPELL_AVAILABLE, _HUNSPELL_ENGINE, _HUNSPELL_ENGINE_NAME
-
     try:
         import phunspell  # type: ignore
 
@@ -83,7 +82,6 @@ def _try_init_hunspell_hu() -> None:
 
 def _try_init_hunspell_en() -> None:
     global _HUNSPELL_EN_AVAILABLE, _HUNSPELL_EN_ENGINE, _HUNSPELL_EN_ENGINE_NAME
-
     try:
         import phunspell  # type: ignore
 
@@ -112,43 +110,37 @@ def _try_init_hunspell_en() -> None:
 def hunspell_hu_lookup(word: str) -> bool:
     if not _HUNSPELL_AVAILABLE or _HUNSPELL_ENGINE is None:
         return False
-
     if hasattr(_HUNSPELL_ENGINE, "lookup"):
         try:
             return bool(_HUNSPELL_ENGINE.lookup(word))
         except Exception:
             return False
-
     if hasattr(_HUNSPELL_ENGINE, "spell"):
         try:
             return bool(_HUNSPELL_ENGINE.spell(word))
         except Exception:
             return False
-
     return False
 
 
 def hunspell_en_lookup(word: str) -> bool:
     if not _HUNSPELL_EN_AVAILABLE or _HUNSPELL_EN_ENGINE is None:
         return False
-
     if hasattr(_HUNSPELL_EN_ENGINE, "lookup"):
         try:
             return bool(_HUNSPELL_EN_ENGINE.lookup(word))
         except Exception:
             return False
-
     if hasattr(_HUNSPELL_EN_ENGINE, "spell"):
         try:
             return bool(_HUNSPELL_EN_ENGINE.spell(word))
         except Exception:
             return False
-
     return False
 
 
 # ============================
-# Text cleanup/tokenize
+# Text cleanup/tokenize basics
 # ============================
 URL_HTTP_RE = re.compile(r"https?://\S+", flags=re.IGNORECASE)
 URL_WWW_RE = re.compile(r"\bwww\.\S+", flags=re.IGNORECASE)
@@ -157,15 +149,145 @@ URL_RE = re.compile(r"(https?://\S+|\bwww\.\S+)", flags=re.IGNORECASE)
 MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 INLINE_CODE_RE = re.compile(r"`[^`]*`")
 
-# words for language: letters only
 WORD_RE = re.compile(r"[^\W\d_]+", flags=re.UNICODE)
-# token for single-word decisions: letters+digits (no underscore)
 SINGLE_TOKEN_RE = re.compile(r"[0-9A-Za-z\u00C0-\u024F\u1E00-\u1EFF]+", flags=re.UNICODE)
 
 CJK_RE = re.compile(r"[\u4E00-\u9FFF\u3400-\u4DBF\u3040-\u30FF\uAC00-\uD7AF]")
 
 
+# ============================
+# Emoji / emoticon removal (FULL)
+# ============================
+_REGEXMOD_AVAILABLE = False
+try:
+    import regex as _regex  # type: ignore
+
+    _REGEXMOD_AVAILABLE = True
+except Exception:
+    _regex = None  # type: ignore
+
+_ASCII_EMOTICON_RE = re.compile(
+    r"(?i)(:\-\)|:\)|:\-\(|:\(|;\-\)|;\)|:d|:\-d|:p|:\-p|:\/|:\\|<3)",
+    flags=re.UNICODE,
+)
+_KEYCAP_RE = re.compile(r"[0-9#*]\uFE0F?\u20E3", flags=re.UNICODE)
+_EMOJI_JOINERS_RE = re.compile(r"[\u200D\uFE0E\uFE0F]", flags=re.UNICODE)
+
+_EMOJI_FALLBACK_RE = re.compile(
+    "["
+    "\U0001F1E6-\U0001F1FF"
+    "\U0001F300-\U0001FAFF"
+    "\U0001F000-\U0001F02F"
+    "\u2600-\u26FF"
+    "\u2700-\u27BF"
+    "\U0001F3FB-\U0001F3FF"
+    "]",
+    flags=re.UNICODE,
+)
+
+if _REGEXMOD_AVAILABLE:
+    _EMOJI_PROP_RE = _regex.compile(
+        r"(?:\p{Extended_Pictographic}|\p{Emoji_Presentation}|\p{Emoji}\uFE0F)"
+        r"(?:\u200D(?:\p{Extended_Pictographic}|\p{Emoji_Presentation}|\p{Emoji}\uFE0F))*"
+        r"(?:\p{Emoji_Modifier})?",
+        flags=_regex.UNICODE,
+    )
+    _EMOJI_MOD_RE = _regex.compile(r"\p{Emoji_Modifier}", flags=_regex.UNICODE)
+else:
+    _EMOJI_PROP_RE = None  # type: ignore
+    _EMOJI_MOD_RE = None  # type: ignore
+
+
+def contains_emoji_or_emoticon(text: str) -> bool:
+    if not text:
+        return False
+    if _ASCII_EMOTICON_RE.search(text):
+        return True
+    if _KEYCAP_RE.search(text):
+        return True
+    if _REGEXMOD_AVAILABLE and _EMOJI_PROP_RE is not None:
+        return bool(_EMOJI_PROP_RE.search(text))
+    return bool(_EMOJI_FALLBACK_RE.search(text))
+
+
+def _remove_emojis_core(text: str) -> str:
+    t = text
+    t = _ASCII_EMOTICON_RE.sub(" ", t)
+    t = _KEYCAP_RE.sub(" ", t)
+
+    if _REGEXMOD_AVAILABLE and _EMOJI_PROP_RE is not None:
+        t = _EMOJI_PROP_RE.sub(" ", t)
+        if _EMOJI_MOD_RE is not None:
+            t = _EMOJI_MOD_RE.sub(" ", t)
+    else:
+        t = _EMOJI_FALLBACK_RE.sub(" ", t)
+
+    t = _EMOJI_JOINERS_RE.sub(" ", t)
+    return t
+
+
+def strip_emojis_emoticons_for_detection(text: str) -> str:
+    t = _remove_emojis_core(text)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def strip_emojis_emoticons_for_output(text: str) -> str:
+    t = _remove_emojis_core(text)
+    t = re.sub(r"[ \t]+", " ", t).strip()
+    return t
+
+
+def is_emoji_only_or_leftover_punct(text: str) -> bool:
+    if not contains_emoji_or_emoticon(text):
+        return False
+
+    t = text
+    t = MD_LINK_RE.sub(" ", t)
+    t = URL_RE.sub(" ", t)
+    t = strip_emojis_emoticons_for_output(t)
+
+    t2 = re.sub(r"[\s\.\,\!\?\:\;\-\_\(\)\[\]\{\}\"\'`]+", "", t)
+    return (t2 == "")
+
+
+# ============================
+# Punctuation / symbol-only noise ( ... +++ !!! ::: etc )
+# ============================
+_PUNCT_SYMBOL_ONLY_RE = re.compile(
+    r"^[\s"
+    r"\.\u2026"
+    r",;:!?\u00A1\u00BF"
+    r"\-\u2010\u2011\u2012\u2013\u2014\u2015"
+    r"_"
+    r"\(\)\[\]\{\}"
+    r"\"\'`"
+    r"~@#\$%\^&\*\+=\|\\/<>"
+    r"]+$",
+    flags=re.UNICODE,
+)
+
+
+def is_punct_only_noise(text: str) -> bool:
+    if not text or not text.strip():
+        return False
+
+    t = text
+    t = MD_LINK_RE.sub(" ", t)
+    t = URL_RE.sub(" ", t)
+    t = strip_emojis_emoticons_for_output(t).strip()
+
+    if not t:
+        return False
+
+    return bool(_PUNCT_SYMBOL_ONLY_RE.match(t))
+
+
+# ============================
+# Other helpers
+# ============================
 def clean_for_lang(text: str) -> str:
+    text = strip_emojis_emoticons_for_detection(text)
     text = URL_RE.sub(" ", text)
     text = MD_LINK_RE.sub(r"\1", text)
     text = INLINE_CODE_RE.sub(" ", text)
@@ -202,10 +324,6 @@ def make_preview(s: str, n: int = 140) -> str:
 
 
 def is_link_dominant(text: str, max_leftover_words: int = 2) -> bool:
-    """
-    True if text contains URL/markdown-link and after removing those links
-    the remaining plain words are <= max_leftover_words.
-    """
     t = text.strip()
     if not t:
         return False
@@ -214,11 +332,9 @@ def is_link_dominant(text: str, max_leftover_words: int = 2) -> bool:
     if not has_link:
         return False
 
-    # Remove markdown links then urls
     t2 = MD_LINK_RE.sub(" ", t)
     t2 = URL_RE.sub(" ", t2)
-
-    # Remove leftover punctuation/brackets
+    t2 = strip_emojis_emoticons_for_detection(t2)
     t2 = re.sub(r"[\s\[\]\(\)<>.,;:!?'\"`*_=-]+", " ", t2).strip()
     if not t2:
         return True
@@ -228,24 +344,17 @@ def is_link_dominant(text: str, max_leftover_words: int = 2) -> bool:
 
 
 def single_word_token(text: str) -> Optional[str]:
-    """
-    Single token detector for dictionary decisions:
-    - Removes urls + markdown links
-    - If exactly one alnum-ish token remains -> returns it (lower)
-    """
     t = text.strip()
     if not t:
         return None
-
     t2 = MD_LINK_RE.sub(" ", t)
     t2 = URL_RE.sub(" ", t2)
+    t2 = strip_emojis_emoticons_for_detection(t2)
     t2 = re.sub(r"\s+", " ", t2).strip()
     if not t2:
         return None
-
     if " " in t2:
         return None
-
     m = SINGLE_TOKEN_RE.fullmatch(t2)
     if not m:
         return None
@@ -333,7 +442,7 @@ def hunspell_hu_ratio(text: str, min_word_len: int = 3) -> Optional[float]:
 
 
 # ============================
-# szotar.txt (HU/IDEGEN) - script root forced + auto-create
+# szotar.txt (HU/IDEGEN)
 # ============================
 DICT_HU_HEADER = "[HU]"
 DICT_FOREIGN_HEADER = "[IDEGEN]"
@@ -435,13 +544,8 @@ def apply_single_word_manual_to_szotar(
     text: str,
     *,
     szotar: SzotarStore,
-    user_kept: bool,  # True => HU, False => IDEGEN
+    user_kept: bool,
 ) -> bool:
-    """
-    If text is single-token, ALWAYS update szotar according to user decision.
-    This happens regardless of any detector.
-    Returns True if applied, else False.
-    """
     w = single_word_token(text)
     if w is None:
         return False
@@ -465,9 +569,9 @@ def collect_words_from_text_to_szotar(
     noask: bool,
 ) -> None:
     """
-    Multiword esetben: ha user 'MEGTART'-ot nyomott (ambiguousnál), akkor
-    új szavakra rákérdez, és HU/IDEGEN-be rakja.
-    (Egyszavasnál ezt nem használjuk, azt a single_word_manual kezeli.)
+    UNIFIED PROMPT:
+      "HU listába?"  Enter/y -> HU, n -> IDEGEN
+    EN hunspell csak HINT a kérdésben, de NEM dönt automatikusan.
     """
     if noask:
         return
@@ -486,27 +590,28 @@ def collect_words_from_text_to_szotar(
             ordered.append(w)
 
     changed = False
+
     for w in ordered:
         if szotar.contains_hu(w) or szotar.contains_foreign(w):
             continue
 
-        # HU hunspell tudja -> ne kérdezzük
+        # HU hunspell ismeri -> ne szótárazzuk feleslegesen
         if _HUNSPELL_AVAILABLE and hunspell_hu_lookup(w):
             continue
 
-        # EN hunspell tudja -> idegennek ajánlani
+        hint = ""
         if _HUNSPELL_EN_AVAILABLE and hunspell_en_lookup(w):
-            ans = input(f"'{w}' EN hunspell szerint angol. IDEGEN listába? (Enter/y=igen, n=nem) [Y/n]: ").strip().lower()
-            if ans in {"", "y"}:
-                szotar.add_foreign(w)
-                changed = True
-            continue
+            hint = " (EN hunspell: angol?)"
 
-        ans2 = input(f"Új szó: '{w}' | HU szótárba? (Enter/y=igen, n=IDEGEN, s=skip) [Y/n/s]: ").strip().lower()
-        if ans2 in {"", "y"}:
+        ans = input(f"Új szó: '{w}'{hint} | HU listába? (Enter/y=igen, n=IDEGEN) [Y/n]: ").strip().lower()
+        if ans in {"", "y"}:
             szotar.add_hu(w)
             changed = True
-        elif ans2 == "n":
+        elif ans == "n":
+            szotar.add_foreign(w)
+            changed = True
+        else:
+            # ha valami mást ír be: idegennek vesszük
             szotar.add_foreign(w)
             changed = True
 
@@ -515,24 +620,65 @@ def collect_words_from_text_to_szotar(
 
 
 # ============================
+# Combined scoring (exclusive allocation)
+# ============================
+def clamp01(x: float) -> float:
+    if x < 0.0:
+        return 0.0
+    if x > 1.0:
+        return 1.0
+    return x
+
+
+def combined_hu_foreign_scores(
+    *,
+    dict_hu_ratio: float,
+    dict_foreign_ratio: float,
+    hs_hu: float,
+    ld_hu: float,
+    top_lang: str,
+    top_prob: float,
+    en_prob: float,
+) -> Tuple[float, float, float, float]:
+    top_hu = top_prob if top_lang == "hu" else 0.0
+    top_foreign = top_prob if (top_lang not in {"", "hu"}) else 0.0
+
+    hu_raw = dict_hu_ratio + hs_hu + ld_hu + top_hu
+    foreign_raw = dict_foreign_ratio + en_prob + top_foreign
+
+    if hu_raw >= foreign_raw:
+        hu_score = clamp01(hu_raw)
+        foreign_score = clamp01(min(1.0 - hu_score, foreign_raw))
+    else:
+        foreign_score = clamp01(foreign_raw)
+        hu_score = clamp01(min(1.0 - foreign_score, hu_raw))
+
+    return hu_score, foreign_score, hu_raw, foreign_raw
+
+
+# ============================
 # ITEM-level decision
-#   - link-dominant => delete
-#   - single-word => szotar first
-#   - NEW v20: dict ratios early-exit (HU keep / IDEGEN delete) BEFORE detectors
 # ============================
 @dataclass
 class Decision:
     delete: bool
+    reason: str
+
     ld_hu: float
-    ld_top_lang: str
-    ld_top_prob: float
+    top_lang: str
+    top_prob: float
+    en_prob: float
     hs_hu: float
     dict_hu_ratio: float
     dict_foreign_ratio: float
-    en_prob: float
+
+    hu_score: float
+    foreign_score: float
+    hu_raw: float
+    foreign_raw: float
+
     preview: str
     kind: str
-    reason: str
 
 
 def decide_item(
@@ -540,85 +686,164 @@ def decide_item(
     *,
     kind: str,
     force_heuristic: bool,
-    ld_hu_threshold: float,
+    main_threshold: float,
     ld_any_threshold: float,
-    hunspell_threshold: float,
     hunspell_min_word_len: int,
     en_item_threshold: float,
     szotar: SzotarStore,
-    dict_hu_threshold: float,
-    dict_foreign_threshold: float,
     dict_min_word_len: int,
     zero_eps: float,
     min_words: int,
 ) -> Decision:
     prev = make_preview(text)
 
-    # 1) link-dominant => delete always
+    # auto delete: emoji-only or emoji+punct leftover
+    if is_emoji_only_or_leftover_punct(text):
+        return Decision(
+            delete=True,
+            reason="emoji_only_delete",
+            ld_hu=0.0,
+            top_lang="",
+            top_prob=0.0,
+            en_prob=0.0,
+            hs_hu=0.0,
+            dict_hu_ratio=0.0,
+            dict_foreign_ratio=0.0,
+            hu_score=0.0,
+            foreign_score=1.0,
+            hu_raw=0.0,
+            foreign_raw=1.0,
+            preview=prev,
+            kind=kind,
+        )
+
+    # auto delete: punctuation/symbol-only noise: ... +++ !!! ::: etc
+    if is_punct_only_noise(text):
+        return Decision(
+            delete=True,
+            reason="punct_only_delete",
+            ld_hu=0.0,
+            top_lang="",
+            top_prob=0.0,
+            en_prob=0.0,
+            hs_hu=0.0,
+            dict_hu_ratio=0.0,
+            dict_foreign_ratio=0.0,
+            hu_score=0.0,
+            foreign_score=1.0,
+            hu_raw=0.0,
+            foreign_raw=1.0,
+            preview=prev,
+            kind=kind,
+        )
+
+    # auto delete: link-dominant
     if is_link_dominant(text):
         return Decision(
-            delete=True, ld_hu=0.0, ld_top_lang="", ld_top_prob=0.0, hs_hu=0.0,
-            dict_hu_ratio=0.0, dict_foreign_ratio=0.0, en_prob=0.0,
-            preview=prev, kind=kind, reason="link_dominant_delete"
+            delete=True,
+            reason="link_dominant_delete",
+            ld_hu=0.0,
+            top_lang="",
+            top_prob=0.0,
+            en_prob=0.0,
+            hs_hu=0.0,
+            dict_hu_ratio=0.0,
+            dict_foreign_ratio=0.0,
+            hu_score=0.0,
+            foreign_score=1.0,
+            hu_raw=0.0,
+            foreign_raw=1.0,
+            preview=prev,
+            kind=kind,
         )
 
-    # 2) CJK => delete
+    # auto delete: CJK
     if has_cjk(text):
         return Decision(
-            delete=True, ld_hu=0.0, ld_top_lang="", ld_top_prob=0.0, hs_hu=0.0,
-            dict_hu_ratio=0.0, dict_foreign_ratio=1.0, en_prob=0.0,
-            preview=prev, kind=kind, reason="foreign_cjk"
+            delete=True,
+            reason="foreign_cjk",
+            ld_hu=0.0,
+            top_lang="",
+            top_prob=0.0,
+            en_prob=0.0,
+            hs_hu=0.0,
+            dict_hu_ratio=0.0,
+            dict_foreign_ratio=1.0,
+            hu_score=0.0,
+            foreign_score=1.0,
+            hu_raw=0.0,
+            foreign_raw=1.0,
+            preview=prev,
+            kind=kind,
         )
 
-    # 3) SINGLE WORD => szotar FIRST (no detectors)
+    # single-word => szotar first
     sw = single_word_token(text)
     if sw is not None:
         if szotar.contains_foreign(sw):
             return Decision(
-                delete=True, ld_hu=0.0, ld_top_lang="", ld_top_prob=0.0, hs_hu=0.0,
-                dict_hu_ratio=0.0, dict_foreign_ratio=1.0, en_prob=0.0,
-                preview=prev, kind=kind, reason="single_word_szotar_foreign_delete"
+                delete=True,
+                reason="single_word_szotar_foreign_delete",
+                ld_hu=0.0,
+                top_lang="",
+                top_prob=0.0,
+                en_prob=0.0,
+                hs_hu=0.0,
+                dict_hu_ratio=0.0,
+                dict_foreign_ratio=1.0,
+                hu_score=0.0,
+                foreign_score=1.0,
+                hu_raw=0.0,
+                foreign_raw=1.0,
+                preview=prev,
+                kind=kind,
             )
         if szotar.contains_hu(sw):
             return Decision(
-                delete=False, ld_hu=0.0, ld_top_lang="", ld_top_prob=0.0, hs_hu=0.0,
-                dict_hu_ratio=1.0, dict_foreign_ratio=0.0, en_prob=0.0,
-                preview=prev, kind=kind, reason="single_word_szotar_hu_keep"
+                delete=False,
+                reason="single_word_szotar_hu_keep",
+                ld_hu=0.0,
+                top_lang="",
+                top_prob=0.0,
+                en_prob=0.0,
+                hs_hu=0.0,
+                dict_hu_ratio=1.0,
+                dict_foreign_ratio=0.0,
+                hu_score=1.0,
+                foreign_score=0.0,
+                hu_raw=1.0,
+                foreign_raw=0.0,
+                preview=prev,
+                kind=kind,
             )
-        # if not in dict => continue
 
     cleaned = clean_for_lang(text)
     words = tokenize_words(cleaned)
-
     if not words:
         return Decision(
-            delete=False, ld_hu=0.0, ld_top_lang="", ld_top_prob=0.0, hs_hu=0.0,
-            dict_hu_ratio=0.0, dict_foreign_ratio=0.0, en_prob=0.0,
-            preview=prev, kind=kind, reason="ask_zero"
+            delete=False,
+            reason="ask_zero",
+            ld_hu=0.0,
+            top_lang="",
+            top_prob=0.0,
+            en_prob=0.0,
+            hs_hu=0.0,
+            dict_hu_ratio=0.0,
+            dict_foreign_ratio=0.0,
+            hu_score=0.0,
+            foreign_score=0.0,
+            hu_raw=0.0,
+            foreign_raw=0.0,
+            preview=prev,
+            kind=kind,
         )
 
-    # 4) DICT ratios EARLY-EXIT (YOUR REQUEST)
     dict_hu_ratio = ratio_in_set(words, szotar.hu, dict_min_word_len)
     dict_foreign_ratio = ratio_in_set(words, szotar.foreign, dict_min_word_len)
 
-    if dict_foreign_ratio >= dict_foreign_threshold:
-        return Decision(
-            delete=True, ld_hu=0.0, ld_top_lang="", ld_top_prob=0.0, hs_hu=0.0,
-            dict_hu_ratio=dict_hu_ratio, dict_foreign_ratio=dict_foreign_ratio, en_prob=0.0,
-            preview=prev, kind=kind, reason="foreign_dict_delete_fast"
-        )
-
-    if dict_hu_ratio >= dict_hu_threshold:
-        return Decision(
-            delete=False, ld_hu=0.0, ld_top_lang="", ld_top_prob=0.0, hs_hu=0.0,
-            dict_hu_ratio=dict_hu_ratio, dict_foreign_ratio=dict_foreign_ratio, en_prob=0.0,
-            preview=prev, kind=kind, reason="hu_dict_keep_fast"
-        )
-
-    # 5) only now: detectors
     ld_hu = 0.0
-    ld_top_lang = ""
-    ld_top_prob = 0.0
+    top_lang = ""
+    top_prob = 0.0
     en_prob = 0.0
 
     if _LANGDETECT_AVAILABLE and (not force_heuristic) and detect_langs is not None:
@@ -630,40 +855,57 @@ def decide_item(
 
         top = detect_top_lang(cleaned)
         if top is not None:
-            ld_top_lang, ld_top_prob = top
+            top_lang, top_prob = top
 
     hs = hunspell_hu_ratio(cleaned, min_word_len=hunspell_min_word_len)
     hs_hu = float(hs) if hs is not None else 0.0
 
-    hu_strong = (
-        (ld_hu >= ld_hu_threshold)
-        or (ld_top_lang == "hu" and ld_top_prob >= ld_any_threshold)
-        or (hs is not None and hs_hu >= hunspell_threshold)
+    hu_score, foreign_score, hu_raw, foreign_raw = combined_hu_foreign_scores(
+        dict_hu_ratio=dict_hu_ratio,
+        dict_foreign_ratio=dict_foreign_ratio,
+        hs_hu=hs_hu,
+        ld_hu=ld_hu,
+        top_lang=top_lang,
+        top_prob=top_prob,
+        en_prob=en_prob,
     )
-    if hu_strong:
+
+    if hu_score >= main_threshold:
         return Decision(
             delete=False,
-            ld_hu=ld_hu, ld_top_lang=ld_top_lang, ld_top_prob=ld_top_prob, hs_hu=hs_hu,
-            dict_hu_ratio=dict_hu_ratio, dict_foreign_ratio=dict_foreign_ratio, en_prob=en_prob,
-            preview=prev, kind=kind, reason="hu_strong_keep"
+            reason="hu_combined_keep",
+            ld_hu=ld_hu,
+            top_lang=top_lang,
+            top_prob=top_prob,
+            en_prob=en_prob,
+            hs_hu=hs_hu,
+            dict_hu_ratio=dict_hu_ratio,
+            dict_foreign_ratio=dict_foreign_ratio,
+            hu_score=hu_score,
+            foreign_score=foreign_score,
+            hu_raw=hu_raw,
+            foreign_raw=foreign_raw,
+            preview=prev,
+            kind=kind,
         )
 
-    foreign_strong = (
-        (en_prob >= en_item_threshold)
-        or (ld_top_lang == "en" and ld_top_prob >= ld_any_threshold)
-        or (ld_top_lang not in {"", "hu"} and ld_top_prob >= ld_any_threshold)
-    )
-    if foreign_strong:
-        if (ld_top_lang == "en" and ld_top_prob >= ld_any_threshold) or (en_prob >= en_item_threshold):
-            reason = "foreign_en_delete"
-        else:
-            reason = f"foreign_top_{ld_top_lang}_delete"
-
+    if foreign_score >= main_threshold:
         return Decision(
             delete=True,
-            ld_hu=ld_hu, ld_top_lang=ld_top_lang, ld_top_prob=ld_top_prob, hs_hu=hs_hu,
-            dict_hu_ratio=dict_hu_ratio, dict_foreign_ratio=dict_foreign_ratio, en_prob=en_prob,
-            preview=prev, kind=kind, reason=reason
+            reason="foreign_combined_delete",
+            ld_hu=ld_hu,
+            top_lang=top_lang,
+            top_prob=top_prob,
+            en_prob=en_prob,
+            hs_hu=hs_hu,
+            dict_hu_ratio=dict_hu_ratio,
+            dict_foreign_ratio=dict_foreign_ratio,
+            hu_score=hu_score,
+            foreign_score=foreign_score,
+            hu_raw=hu_raw,
+            foreign_raw=foreign_raw,
+            preview=prev,
+            kind=kind,
         )
 
     eligible_words = [w for w in words if len(w) >= hunspell_min_word_len]
@@ -674,35 +916,44 @@ def decide_item(
         and (en_prob <= zero_eps)
         and (dict_hu_ratio <= zero_eps)
         and (dict_foreign_ratio <= zero_eps)
-        and (ld_top_prob <= zero_eps)
+        and (top_prob <= zero_eps)
     )
+    reason = "ask_zero" if (too_short or near_zero) else "ask"
 
     return Decision(
         delete=False,
-        ld_hu=ld_hu, ld_top_lang=ld_top_lang, ld_top_prob=ld_top_prob, hs_hu=hs_hu,
-        dict_hu_ratio=dict_hu_ratio, dict_foreign_ratio=dict_foreign_ratio, en_prob=en_prob,
-        preview=prev, kind=kind, reason=("ask_zero" if (too_short or near_zero) else "ask")
+        reason=reason,
+        ld_hu=ld_hu,
+        top_lang=top_lang,
+        top_prob=top_prob,
+        en_prob=en_prob,
+        hs_hu=hs_hu,
+        dict_hu_ratio=dict_hu_ratio,
+        dict_foreign_ratio=dict_foreign_ratio,
+        hu_score=hu_score,
+        foreign_score=foreign_score,
+        hu_raw=hu_raw,
+        foreign_raw=foreign_raw,
+        preview=prev,
+        kind=kind,
     )
 
 
 def handle_item_prompt(dec: Decision, noask: bool) -> Tuple[bool, bool]:
     """
     returns (delete?, user_kept?)
-    y = keep
-    else = delete
+    y = keep, else delete
     if --noask: keep ambiguous
     """
     if noask:
         return False, True
 
-    if dec.reason == "ask_zero":
-        print("\n[ASK_ZERO] Túl kevés / nincs elég bizonyíték -> kézi döntés.")
-    else:
-        print("\n[ASK] Nem egyértelmű (nem HU>=thr és nem foreign>=thr) -> kézi döntés.")
-
+    print("\n[ASK] Nem egyértelmű (HU_score<thr és FOREIGN_score<thr) -> kézi döntés.")
     print(
         f"Kind: {dec.kind} | reason={dec.reason} | "
-        f"ld_hu={dec.ld_hu:.6f} | top={dec.ld_top_lang}:{dec.ld_top_prob:.3f} | en_prob={dec.en_prob:.6f} | "
+        f"HU_score={dec.hu_score:.3f} (raw={dec.hu_raw:.3f}) | "
+        f"FOREIGN_score={dec.foreign_score:.3f} (raw={dec.foreign_raw:.3f}) | "
+        f"ld_hu={dec.ld_hu:.6f} | top={dec.top_lang}:{dec.top_prob:.3f} | en_prob={dec.en_prob:.6f} | "
         f"hs_hu={dec.hs_hu:.6f} | dict_hu={dec.dict_hu_ratio:.3f} | dict_foreign={dec.dict_foreign_ratio:.3f}"
     )
     print(f"Preview: {dec.preview}")
@@ -713,102 +964,236 @@ def handle_item_prompt(dec: Decision, noask: bool) -> Tuple[bool, bool]:
 
 
 # ============================
-# Sentence-level filtering
-#   - link-dominant delete
-#   - single-word: szotar-first
-#   - dict ratios early-exit (already)
-#   - english delete strong
-#   - english near-thr ask
+# Sentence-level decision
 # ============================
 @dataclass
 class SentDecision:
     keep: bool
     reason: str
-    en_prob: float
+
+    ld_hu: float
     top_lang: str
     top_prob: float
-    foreign_ratio: float
-    hu_ratio: float
+    en_prob: float
+    hs_hu: float
+    dict_hu_ratio: float
+    dict_foreign_ratio: float
+
+    hu_score: float
+    foreign_score: float
+    hu_raw: float
+    foreign_raw: float
+
     preview: str
 
 
 def decide_sentence(
     sentence: str,
     *,
-    ld_any_threshold: float,
-    en_sentence_threshold: float,
-    margin: float,
-    dict_foreign_threshold: float,
-    dict_hu_threshold: float,
+    main_threshold: float,
+    hunspell_min_word_len: int,
     dict_min_word_len: int,
     szotar: SzotarStore,
+    force_heuristic: bool,
 ) -> SentDecision:
     prev = make_preview(sentence)
 
+    if is_emoji_only_or_leftover_punct(sentence):
+        return SentDecision(
+            keep=False,
+            reason="emoji_only_delete",
+            ld_hu=0.0,
+            top_lang="",
+            top_prob=0.0,
+            en_prob=0.0,
+            hs_hu=0.0,
+            dict_hu_ratio=0.0,
+            dict_foreign_ratio=0.0,
+            hu_score=0.0,
+            foreign_score=1.0,
+            hu_raw=0.0,
+            foreign_raw=1.0,
+            preview=prev,
+        )
+
+    if is_punct_only_noise(sentence):
+        return SentDecision(
+            keep=False,
+            reason="punct_only_delete",
+            ld_hu=0.0,
+            top_lang="",
+            top_prob=0.0,
+            en_prob=0.0,
+            hs_hu=0.0,
+            dict_hu_ratio=0.0,
+            dict_foreign_ratio=0.0,
+            hu_score=0.0,
+            foreign_score=1.0,
+            hu_raw=0.0,
+            foreign_raw=1.0,
+            preview=prev,
+        )
+
     if is_link_dominant(sentence):
-        return SentDecision(False, "link_dominant_delete", 0.0, "", 0.0, 0.0, 0.0, prev)
+        return SentDecision(
+            keep=False,
+            reason="link_dominant_delete",
+            ld_hu=0.0,
+            top_lang="",
+            top_prob=0.0,
+            en_prob=0.0,
+            hs_hu=0.0,
+            dict_hu_ratio=0.0,
+            dict_foreign_ratio=0.0,
+            hu_score=0.0,
+            foreign_score=1.0,
+            hu_raw=0.0,
+            foreign_raw=1.0,
+            preview=prev,
+        )
 
     cleaned = clean_for_lang(sentence)
     if not cleaned:
-        return SentDecision(True, "empty", 0.0, "", 0.0, 0.0, 0.0, prev)
+        return SentDecision(
+            keep=True,
+            reason="empty",
+            ld_hu=0.0,
+            top_lang="",
+            top_prob=0.0,
+            en_prob=0.0,
+            hs_hu=0.0,
+            dict_hu_ratio=0.0,
+            dict_foreign_ratio=0.0,
+            hu_score=0.0,
+            foreign_score=0.0,
+            hu_raw=0.0,
+            foreign_raw=0.0,
+            preview=prev,
+        )
 
     if has_cjk(cleaned):
-        return SentDecision(False, "cjk", 0.0, "", 0.0, 1.0, 0.0, prev)
+        return SentDecision(
+            keep=False,
+            reason="foreign_cjk",
+            ld_hu=0.0,
+            top_lang="",
+            top_prob=0.0,
+            en_prob=0.0,
+            hs_hu=0.0,
+            dict_hu_ratio=0.0,
+            dict_foreign_ratio=1.0,
+            hu_score=0.0,
+            foreign_score=1.0,
+            hu_raw=0.0,
+            foreign_raw=1.0,
+            preview=prev,
+        )
 
-    # single-word: szotar first
+    # single-word => szotar first
     sw = single_word_token(sentence)
     if sw is not None:
         if szotar.contains_foreign(sw):
-            return SentDecision(False, "single_word_szotar_foreign_delete", 0.0, "", 0.0, 1.0, 0.0, prev)
+            return SentDecision(
+                keep=False,
+                reason="single_word_szotar_foreign_delete",
+                ld_hu=0.0,
+                top_lang="",
+                top_prob=0.0,
+                en_prob=0.0,
+                hs_hu=0.0,
+                dict_hu_ratio=0.0,
+                dict_foreign_ratio=1.0,
+                hu_score=0.0,
+                foreign_score=1.0,
+                hu_raw=0.0,
+                foreign_raw=1.0,
+                preview=prev,
+            )
         if szotar.contains_hu(sw):
-            return SentDecision(True, "single_word_szotar_hu_keep", 0.0, "", 0.0, 0.0, 1.0, prev)
+            return SentDecision(
+                keep=True,
+                reason="single_word_szotar_hu_keep",
+                ld_hu=0.0,
+                top_lang="",
+                top_prob=0.0,
+                en_prob=0.0,
+                hs_hu=0.0,
+                dict_hu_ratio=1.0,
+                dict_foreign_ratio=0.0,
+                hu_score=1.0,
+                foreign_score=0.0,
+                hu_raw=1.0,
+                foreign_raw=0.0,
+                preview=prev,
+            )
 
     words = tokenize_words(cleaned)
+    dict_hu_ratio = ratio_in_set(words, szotar.hu, dict_min_word_len)
+    dict_foreign_ratio = ratio_in_set(words, szotar.foreign, dict_min_word_len)
 
-    foreign_ratio = ratio_in_set(words, szotar.foreign, dict_min_word_len)
-    if foreign_ratio >= dict_foreign_threshold:
-        return SentDecision(False, "idegen_list", 0.0, "", 0.0, foreign_ratio, 0.0, prev)
-
-    hu_ratio = ratio_in_set(words, szotar.hu, dict_min_word_len)
-    if hu_ratio >= dict_hu_threshold:
-        return SentDecision(True, "kept_bc_szotar", 0.0, "", 0.0, foreign_ratio, hu_ratio, prev)
-
-    en_prob = 0.0
+    ld_hu = 0.0
     top_lang = ""
     top_prob = 0.0
+    en_prob = 0.0
 
-    if _LANGDETECT_AVAILABLE and detect_langs is not None:
-        r = _lang_prob_ratio_langdetect(cleaned, "en")
-        en_prob = float(r) if r is not None else 0.0
+    if _LANGDETECT_AVAILABLE and (not force_heuristic) and detect_langs is not None:
+        r_hu = _lang_prob_ratio_langdetect(cleaned, "hu")
+        ld_hu = float(r_hu) if r_hu is not None else 0.0
+
+        r_en = _lang_prob_ratio_langdetect(cleaned, "en")
+        en_prob = float(r_en) if r_en is not None else 0.0
+
         top = detect_top_lang(cleaned)
         if top is not None:
             top_lang, top_prob = top
 
-        strong_en = (en_prob >= en_sentence_threshold) or (top_lang == "en" and top_prob >= ld_any_threshold)
-        if strong_en:
-            return SentDecision(False, "en_strong", en_prob, top_lang, top_prob, foreign_ratio, hu_ratio, prev)
+    hs = hunspell_hu_ratio(cleaned, min_word_len=hunspell_min_word_len)
+    hs_hu = float(hs) if hs is not None else 0.0
 
-        near_en = ((en_sentence_threshold - margin) <= en_prob < en_sentence_threshold) or (
-            top_lang == "en" and (ld_any_threshold - margin) <= top_prob < ld_any_threshold
-        )
-        if near_en:
-            return SentDecision(True, "en_ambiguous_ask", en_prob, top_lang, top_prob, foreign_ratio, hu_ratio, prev)
-
-    return SentDecision(True, "keep", en_prob, top_lang, top_prob, foreign_ratio, hu_ratio, prev)
-
-
-def prompt_keep_ambiguous_sentence(sd: SentDecision, kind: str, noask: bool) -> bool:
-    if noask:
-        return True
-
-    print("\n[AMBIGUOUS EN SENTENCE] Küszöb közelében -> kézi döntés.")
-    print(
-        f"Kind: {kind} | en_prob={sd.en_prob:.6f} | top={sd.top_lang}:{sd.top_prob:.3f} | "
-        f"foreign_ratio={sd.foreign_ratio:.3f} | hu_ratio={sd.hu_ratio:.3f}"
+    hu_score, foreign_score, hu_raw, foreign_raw = combined_hu_foreign_scores(
+        dict_hu_ratio=dict_hu_ratio,
+        dict_foreign_ratio=dict_foreign_ratio,
+        hs_hu=hs_hu,
+        ld_hu=ld_hu,
+        top_lang=top_lang,
+        top_prob=top_prob,
+        en_prob=en_prob,
     )
-    print(f"Preview: {sd.preview}")
-    ans = input("Döntés? (y=MEGTART, n/Enter=TÖRÖL) [y/N]: ").strip().lower()
-    return ans == "y"
+
+    if foreign_score >= main_threshold:
+        return SentDecision(
+            keep=False,
+            reason="foreign_combined_delete",
+            ld_hu=ld_hu,
+            top_lang=top_lang,
+            top_prob=top_prob,
+            en_prob=en_prob,
+            hs_hu=hs_hu,
+            dict_hu_ratio=dict_hu_ratio,
+            dict_foreign_ratio=dict_foreign_ratio,
+            hu_score=hu_score,
+            foreign_score=foreign_score,
+            hu_raw=hu_raw,
+            foreign_raw=foreign_raw,
+            preview=prev,
+        )
+
+    return SentDecision(
+        keep=True,
+        reason="keep",
+        ld_hu=ld_hu,
+        top_lang=top_lang,
+        top_prob=top_prob,
+        en_prob=en_prob,
+        hs_hu=hs_hu,
+        dict_hu_ratio=dict_hu_ratio,
+        dict_foreign_ratio=dict_foreign_ratio,
+        hu_score=hu_score,
+        foreign_score=foreign_score,
+        hu_raw=hu_raw,
+        foreign_raw=foreign_raw,
+        preview=prev,
+    )
 
 
 def filter_text_sentences(
@@ -818,79 +1203,39 @@ def filter_text_sentences(
     file_name: str,
     show_deleted: bool,
     noask: bool,
-    ld_any_threshold: float,
-    en_sentence_threshold: float,
-    margin: float,
-    dict_foreign_threshold: float,
-    dict_hu_threshold: float,
+    main_threshold: float,
+    hunspell_min_word_len: int,
     dict_min_word_len: int,
     dict_collect_min_word_len: int,
     szotar: SzotarStore,
+    force_heuristic: bool,
 ) -> str:
     chunks = split_into_chunks(text)
     if not chunks:
-        return text
+        return strip_emojis_emoticons_for_output(text)
 
     kept: List[str] = []
-
     for ch in chunks:
         sd = decide_sentence(
             ch,
-            ld_any_threshold=ld_any_threshold,
-            en_sentence_threshold=en_sentence_threshold,
-            margin=margin,
-            dict_foreign_threshold=dict_foreign_threshold,
-            dict_hu_threshold=dict_hu_threshold,
+            main_threshold=main_threshold,
+            hunspell_min_word_len=hunspell_min_word_len,
             dict_min_word_len=dict_min_word_len,
             szotar=szotar,
+            force_heuristic=force_heuristic,
         )
-
-        if sd.reason in {"kept_bc_szotar", "single_word_szotar_hu_keep"}:
-            if sd.reason == "kept_bc_szotar":
-                print(f"[KEPT, bc szotar.txt] {file_name} | {context_kind} | hu_ratio={sd.hu_ratio:.3f} | {sd.preview}")
-            kept.append(ch)
-            continue
-
-        if sd.reason == "en_ambiguous_ask":
-            keep_it = prompt_keep_ambiguous_sentence(sd, kind=f"{file_name} | {context_kind}", noask=noask)
-
-            # SINGLE WORD: ALWAYS update dictionary according to user
-            if apply_single_word_manual_to_szotar(ch, szotar=szotar, user_kept=keep_it):
-                if keep_it:
-                    kept.append(ch)
-                else:
-                    if show_deleted:
-                        print(f"[DELETED_SENT] {file_name} | {context_kind} | reason=single_word_manual_delete | {sd.preview}")
-                continue
-
-            if keep_it:
-                kept.append(ch)
-                collect_words_from_text_to_szotar(
-                    ch,
-                    szotar=szotar,
-                    min_word_len=dict_collect_min_word_len,
-                    noask=noask,
-                )
-            else:
-                if show_deleted:
-                    print(
-                        f"[DELETED_SENT] {file_name} | {context_kind} | reason=en_ambiguous_user_delete | "
-                        f"en_prob={sd.en_prob:.3f} top={sd.top_lang}:{sd.top_prob:.3f} | {sd.preview}"
-                    )
-            continue
-
         if not sd.keep:
             if show_deleted:
                 print(
                     f"[DELETED_SENT] {file_name} | {context_kind} | reason={sd.reason} | "
-                    f"en_prob={sd.en_prob:.3f} top={sd.top_lang}:{sd.top_prob:.3f} | "
-                    f"foreign_ratio={sd.foreign_ratio:.3f} hu_ratio={sd.hu_ratio:.3f} | {sd.preview}"
+                    f"FOREIGN_score={sd.foreign_score:.3f} (raw={sd.foreign_raw:.3f}) | "
+                    f"HU_score={sd.hu_score:.3f} (raw={sd.hu_raw:.3f}) | top={sd.top_lang}:{sd.top_prob:.3f} | "
+                    f"dict_foreign={sd.dict_foreign_ratio:.3f} dict_hu={sd.dict_hu_ratio:.3f} | {sd.preview}"
                 )
             continue
+        kept.append(strip_emojis_emoticons_for_output(ch))
 
-        kept.append(ch)
-
-    return "\n".join(kept).strip()
+    return "\n".join([k for k in kept if k.strip()]).strip()
 
 
 # ============================
@@ -1035,14 +1380,12 @@ def rewrite_post_pre_block(
     file_name: str,
     show_deleted: bool,
     noask: bool,
-    ld_any_threshold: float,
-    en_sentence_threshold: float,
-    margin: float,
-    dict_foreign_threshold: float,
-    dict_hu_threshold: float,
+    main_threshold: float,
+    hunspell_min_word_len: int,
     dict_min_word_len: int,
     dict_collect_min_word_len: int,
     szotar: SzotarStore,
+    force_heuristic: bool,
 ) -> str:
     lines = pre_block.splitlines(keepends=True)
     out: List[str] = []
@@ -1061,14 +1404,12 @@ def rewrite_post_pre_block(
                 file_name=file_name,
                 show_deleted=show_deleted,
                 noask=noask,
-                ld_any_threshold=ld_any_threshold,
-                en_sentence_threshold=en_sentence_threshold,
-                margin=margin,
-                dict_foreign_threshold=dict_foreign_threshold,
-                dict_hu_threshold=dict_hu_threshold,
+                main_threshold=main_threshold,
+                hunspell_min_word_len=hunspell_min_word_len,
                 dict_min_word_len=dict_min_word_len,
                 dict_collect_min_word_len=dict_collect_min_word_len,
                 szotar=szotar,
+                force_heuristic=force_heuristic,
             )
             eol = "\n" if line.endswith("\n") else ""
             out.append(f"by {user}: {new_title}{eol}")
@@ -1095,14 +1436,12 @@ def rewrite_post_pre_block(
                 file_name=file_name,
                 show_deleted=show_deleted,
                 noask=noask,
-                ld_any_threshold=ld_any_threshold,
-                en_sentence_threshold=en_sentence_threshold,
-                margin=margin,
-                dict_foreign_threshold=dict_foreign_threshold,
-                dict_hu_threshold=dict_hu_threshold,
+                main_threshold=main_threshold,
+                hunspell_min_word_len=hunspell_min_word_len,
                 dict_min_word_len=dict_min_word_len,
                 dict_collect_min_word_len=dict_collect_min_word_len,
                 szotar=szotar,
+                force_heuristic=force_heuristic,
             )
 
             if new_body.strip():
@@ -1122,14 +1461,12 @@ def rewrite_comment_block(
     file_name: str,
     show_deleted: bool,
     noask: bool,
-    ld_any_threshold: float,
-    en_sentence_threshold: float,
-    margin: float,
-    dict_foreign_threshold: float,
-    dict_hu_threshold: float,
+    main_threshold: float,
+    hunspell_min_word_len: int,
     dict_min_word_len: int,
     dict_collect_min_word_len: int,
     szotar: SzotarStore,
+    force_heuristic: bool,
 ) -> Optional[str]:
     lines = comment_block.splitlines(keepends=True)
     if not lines:
@@ -1161,14 +1498,12 @@ def rewrite_comment_block(
         file_name=file_name,
         show_deleted=show_deleted,
         noask=noask,
-        ld_any_threshold=ld_any_threshold,
-        en_sentence_threshold=en_sentence_threshold,
-        margin=margin,
-        dict_foreign_threshold=dict_foreign_threshold,
-        dict_hu_threshold=dict_hu_threshold,
+        main_threshold=main_threshold,
+        hunspell_min_word_len=hunspell_min_word_len,
         dict_min_word_len=dict_min_word_len,
         dict_collect_min_word_len=dict_collect_min_word_len,
         szotar=szotar,
+        force_heuristic=force_heuristic,
     )
 
     if not new_text.strip():
@@ -1194,18 +1529,13 @@ def process_file_subreddits(
     in_path: Path,
     out_path: Path,
     *,
-    ld_hu_threshold: float,
+    main_threshold: float,
     ld_any_threshold: float,
-    hunspell_threshold: float,
     hunspell_min_word_len: int,
     en_item_threshold: float,
-    dict_foreign_threshold: float,
-    dict_hu_threshold: float,
     dict_min_word_len: int,
     zero_eps: float,
     min_words: int,
-    en_sentence_threshold: float,
-    margin: float,
     dict_collect_min_word_len: int,
     show_deleted: bool,
     noask: bool,
@@ -1227,21 +1557,18 @@ def process_file_subreddits(
 
         pre, comments = split_post_into_pre_and_comments(block)
 
-        # ---- POST item-level
+        # POST
         total += 1
         post_text = extract_subreddit_post_text(pre)
         post_dec = decide_item(
             post_text,
             kind="Post",
             force_heuristic=force_heuristic,
-            ld_hu_threshold=ld_hu_threshold,
+            main_threshold=main_threshold,
             ld_any_threshold=ld_any_threshold,
-            hunspell_threshold=hunspell_threshold,
             hunspell_min_word_len=hunspell_min_word_len,
             en_item_threshold=en_item_threshold,
             szotar=szotar,
-            dict_hu_threshold=dict_hu_threshold,
-            dict_foreign_threshold=dict_foreign_threshold,
             dict_min_word_len=dict_min_word_len,
             zero_eps=zero_eps,
             min_words=min_words,
@@ -1259,44 +1586,40 @@ def process_file_subreddits(
         if show_deleted:
             tag = "DELETED" if delete_post else "KEPT"
             print(
-                f"[{tag}] {in_path.name} | Post | "
-                f"ld_hu={post_dec.ld_hu:.6f} | top={post_dec.ld_top_lang}:{post_dec.ld_top_prob:.3f} | "
-                f"en_prob={post_dec.en_prob:.6f} | hs_hu={post_dec.hs_hu:.6f} | "
-                f"dict_hu={post_dec.dict_hu_ratio:.3f} | dict_foreign={post_dec.dict_foreign_ratio:.3f} | "
-                f"reason={post_dec.reason} | {post_dec.preview}"
+                f"[{tag}] {in_path.name} | Post | reason={post_dec.reason} | "
+                f"HU_score={post_dec.hu_score:.3f} (raw={post_dec.hu_raw:.3f}) | "
+                f"FOREIGN_score={post_dec.foreign_score:.3f} (raw={post_dec.foreign_raw:.3f}) | "
+                f"ld_hu={post_dec.ld_hu:.6f} | top={post_dec.top_lang}:{post_dec.top_prob:.3f} | en_prob={post_dec.en_prob:.6f} | "
+                f"hs_hu={post_dec.hs_hu:.6f} | dict_hu={post_dec.dict_hu_ratio:.3f} | dict_foreign={post_dec.dict_foreign_ratio:.3f} | "
+                f"{post_dec.preview}"
             )
 
         if delete_post:
             deleted += 1
             continue
 
-        # sentence-level rewrite inside post
         new_pre = rewrite_post_pre_block(
             pre,
             file_name=in_path.name,
             show_deleted=show_deleted,
             noask=noask,
-            ld_any_threshold=ld_any_threshold,
-            en_sentence_threshold=en_sentence_threshold,
-            margin=margin,
-            dict_foreign_threshold=dict_foreign_threshold,
-            dict_hu_threshold=dict_hu_threshold,
+            main_threshold=main_threshold,
+            hunspell_min_word_len=hunspell_min_word_len,
             dict_min_word_len=dict_min_word_len,
             dict_collect_min_word_len=dict_collect_min_word_len,
             szotar=szotar,
+            force_heuristic=force_heuristic,
         )
 
-        new_post_text = extract_subreddit_post_text(new_pre).strip()
-        if not new_post_text:
+        if not extract_subreddit_post_text(new_pre).strip():
             if show_deleted:
                 print(f"[DELETED] {in_path.name} | Post | reason=post_became_empty_after_sentence_filter")
             deleted += 1
             continue
 
-        # optional word collection after manual keep (multiword only)
-        if manual_post and user_kept_post and single_word_token(new_post_text) is None:
+        if manual_post and user_kept_post and single_word_token(post_text) is None:
             collect_words_from_text_to_szotar(
-                new_post_text,
+                post_text,
                 szotar=szotar,
                 min_word_len=dict_collect_min_word_len,
                 noask=noask,
@@ -1304,7 +1627,7 @@ def process_file_subreddits(
 
         kept.append(new_pre)
 
-        # ---- COMMENTS
+        # COMMENTS
         for c in comments:
             total += 1
             c_text = extract_subreddit_comment_text(c)
@@ -1312,14 +1635,11 @@ def process_file_subreddits(
                 c_text,
                 kind="Comment",
                 force_heuristic=force_heuristic,
-                ld_hu_threshold=ld_hu_threshold,
+                main_threshold=main_threshold,
                 ld_any_threshold=ld_any_threshold,
-                hunspell_threshold=hunspell_threshold,
                 hunspell_min_word_len=hunspell_min_word_len,
                 en_item_threshold=en_item_threshold,
                 szotar=szotar,
-                dict_hu_threshold=dict_hu_threshold,
-                dict_foreign_threshold=dict_foreign_threshold,
                 dict_min_word_len=dict_min_word_len,
                 zero_eps=zero_eps,
                 min_words=min_words,
@@ -1337,11 +1657,12 @@ def process_file_subreddits(
             if show_deleted:
                 tag = "DELETED" if delete_c else "KEPT"
                 print(
-                    f"[{tag}] {in_path.name} | Comment | "
-                    f"ld_hu={c_dec.ld_hu:.6f} | top={c_dec.ld_top_lang}:{c_dec.ld_top_prob:.3f} | "
-                    f"en_prob={c_dec.en_prob:.6f} | hs_hu={c_dec.hs_hu:.6f} | "
-                    f"dict_hu={c_dec.dict_hu_ratio:.3f} | dict_foreign={c_dec.dict_foreign_ratio:.3f} | "
-                    f"reason={c_dec.reason} | {c_dec.preview}"
+                    f"[{tag}] {in_path.name} | Comment | reason={c_dec.reason} | "
+                    f"HU_score={c_dec.hu_score:.3f} (raw={c_dec.hu_raw:.3f}) | "
+                    f"FOREIGN_score={c_dec.foreign_score:.3f} (raw={c_dec.foreign_raw:.3f}) | "
+                    f"ld_hu={c_dec.ld_hu:.6f} | top={c_dec.top_lang}:{c_dec.top_prob:.3f} | en_prob={c_dec.en_prob:.6f} | "
+                    f"hs_hu={c_dec.hs_hu:.6f} | dict_hu={c_dec.dict_hu_ratio:.3f} | dict_foreign={c_dec.dict_foreign_ratio:.3f} | "
+                    f"{c_dec.preview}"
                 )
 
             if delete_c:
@@ -1353,14 +1674,12 @@ def process_file_subreddits(
                 file_name=in_path.name,
                 show_deleted=show_deleted,
                 noask=noask,
-                ld_any_threshold=ld_any_threshold,
-                en_sentence_threshold=en_sentence_threshold,
-                margin=margin,
-                dict_foreign_threshold=dict_foreign_threshold,
-                dict_hu_threshold=dict_hu_threshold,
+                main_threshold=main_threshold,
+                hunspell_min_word_len=hunspell_min_word_len,
                 dict_min_word_len=dict_min_word_len,
                 dict_collect_min_word_len=dict_collect_min_word_len,
                 szotar=szotar,
+                force_heuristic=force_heuristic,
             )
 
             if new_c is None:
@@ -1369,15 +1688,13 @@ def process_file_subreddits(
                 deleted += 1
                 continue
 
-            if manual_comment and user_kept_comment:
-                new_c_text = extract_subreddit_comment_text(new_c).strip()
-                if new_c_text and single_word_token(new_c_text) is None:
-                    collect_words_from_text_to_szotar(
-                        new_c_text,
-                        szotar=szotar,
-                        min_word_len=dict_collect_min_word_len,
-                        noask=noask,
-                    )
+            if manual_comment and user_kept_comment and single_word_token(c_text) is None:
+                collect_words_from_text_to_szotar(
+                    c_text,
+                    szotar=szotar,
+                    min_word_len=dict_collect_min_word_len,
+                    noask=noask,
+                )
 
             kept.append(new_c)
 
@@ -1417,7 +1734,7 @@ def main() -> int:
     _try_init_hunspell_en()
 
     p = argparse.ArgumentParser(
-        description="AUTO keep only HU>=thr; AUTO delete only foreign>=thr; else ASK. dict early-exit. link-dominant always delete. single-word: szotar-first; manual y/n ALWAYS updates szotar."
+        description="HU vs FOREIGN combined scoring; auto delete emoji-only, punct/symbol-only, and link-dominant; szotar in script root."
     )
     p.add_argument("--version", action="version", version=VERSION)
 
@@ -1426,31 +1743,23 @@ def main() -> int:
     p.add_argument("--recursive", action="store_true")
     p.add_argument("--subreddits", action="store_true")
 
-    # thresholds
-    p.add_argument("--ld-hu-threshold", "--threshold", dest="ld_hu_threshold", type=float, default=0.80)
+    p.add_argument("--threshold", type=float, default=0.80, help="Main HU/FOREIGN combined score threshold.")
     p.add_argument("--ld-any-threshold", type=float, default=0.80)
-    p.add_argument("--hunspell-threshold", type=float, default=0.55)
     p.add_argument("--hunspell-min-word-len", type=int, default=3)
-
     p.add_argument("--en-item-threshold", type=float, default=0.80)
-    p.add_argument("--en-sent-threshold", type=float, default=0.80)
 
-    # ask heuristics
     p.add_argument("--zero-eps", type=float, default=0.02)
     p.add_argument("--min-words", type=int, default=4)
-    p.add_argument("--margin", type=float, default=0.10)
 
-    # szotar
-    p.add_argument("--szotar-file", type=str, default="szotar.txt",
-                   help="If relative, resolved relative to script root (main.py folder).")
-    p.add_argument("--dict-foreign-threshold", type=float, default=0.35)
-    p.add_argument("--dict-hu-threshold", type=float, default=0.35)
+    p.add_argument(
+        "--szotar-file",
+        type=str,
+        default="szotar.txt",
+        help="If relative, resolved relative to script root (main.py folder).",
+    )
     p.add_argument("--dict-min-word-len", type=int, default=1)
-
-    # word-collection (multiword optional)
     p.add_argument("--dict-collect-min-word-len", type=int, default=4)
 
-    # runtime
     p.add_argument("--show-deleted", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--inplace", action="store_true")
@@ -1471,7 +1780,8 @@ def main() -> int:
 
     out_dir = in_dir if args.inplace else (
         Path(args.outputfolder).expanduser().resolve()
-        if args.outputfolder else (in_dir / "cleaned")
+        if args.outputfolder
+        else (in_dir / "cleaned")
     )
 
     visited_path = Path("visited.txt").resolve()
@@ -1485,16 +1795,13 @@ def main() -> int:
     detector_info = "langdetect" if _LANGDETECT_AVAILABLE and not args.force_heuristic else "langdetect(unavailable)"
     hunspell_info = _HUNSPELL_ENGINE_NAME if _HUNSPELL_AVAILABLE else "hunspell_hu(unavailable)"
     hunspell_en_info = _HUNSPELL_EN_ENGINE_NAME if _HUNSPELL_EN_AVAILABLE else "hunspell_en(unavailable)"
+    emoji_info = "regex(emoji-props)" if _REGEXMOD_AVAILABLE else "fallback(emoji-ranges)"
 
     print(f"Version: {VERSION}")
-    print(f"Detectors: {detector_info} -> {hunspell_info} | EN: {hunspell_en_info}")
+    print(f"Detectors: {detector_info} -> {hunspell_info} | EN: {hunspell_en_info} | Emoji: {emoji_info}")
     print(f"Szotar (script root): {szotar_path} | exists={szotar_path.exists()} | HU={len(szotar.hu)} | IDEGEN={len(szotar.foreign)}")
     print(f"Visited: {visited_path} | entries={len(visited)}")
-    print(
-        f"THR: ld_hu={args.ld_hu_threshold:.2f} | ld_any={args.ld_any_threshold:.2f} | "
-        f"en_item={args.en_item_threshold:.2f} | en_sent={args.en_sent_threshold:.2f} | "
-        f"dict_foreign={args.dict_foreign_threshold:.2f} | dict_hu={args.dict_hu_threshold:.2f}"
-    )
+    print(f"THR: main={args.threshold:.2f} | dict_min_word_len={args.dict_min_word_len}")
 
     files_all = iter_files(in_dir, args.recursive, args.pattern)
 
@@ -1529,18 +1836,13 @@ def main() -> int:
             total, deleted = process_file_subreddits(
                 in_path=f,
                 out_path=out_path,
-                ld_hu_threshold=args.ld_hu_threshold,
+                main_threshold=args.threshold,
                 ld_any_threshold=args.ld_any_threshold,
-                hunspell_threshold=args.hunspell_threshold,
                 hunspell_min_word_len=args.hunspell_min_word_len,
                 en_item_threshold=args.en_item_threshold,
-                dict_foreign_threshold=args.dict_foreign_threshold,
-                dict_hu_threshold=args.dict_hu_threshold,
                 dict_min_word_len=args.dict_min_word_len,
                 zero_eps=args.zero_eps,
                 min_words=args.min_words,
-                en_sentence_threshold=args.en_sent_threshold,
-                margin=args.margin,
                 dict_collect_min_word_len=args.dict_collect_min_word_len,
                 show_deleted=args.show_deleted,
                 noask=args.noask,
