@@ -6,9 +6,9 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple, Set
+from typing import List, Optional, Tuple, Set, Dict
 
-VERSION = "2026-02-16_v9 (removed stopwords; langdetect HU -> hunspell -> delete)"
+VERSION = "2026-02-17_v10 (sentence EN removal + szotar.txt HU/IDEGEN + word prompts)"
 
 # ============================
 # Optional langdetect
@@ -31,15 +31,20 @@ _HUNSPELL_AVAILABLE = False
 _HUNSPELL_ENGINE = None
 _HUNSPELL_ENGINE_NAME = ""
 
+_HUNSPELL_EN_AVAILABLE = False
+_HUNSPELL_EN_ENGINE = None
+_HUNSPELL_EN_ENGINE_NAME = ""
+
 
 def _try_init_hunspell() -> None:
     """
-    Prefer phunspell (pure python + bundled dictionaries in many setups).
-    Fallback: hunspell binding if available and dict files found.
+    Hungarian hunspell init.
+    Prefer phunspell.
+    Fallback: hunspell binding if aff/dic found.
     """
     global _HUNSPELL_AVAILABLE, _HUNSPELL_ENGINE, _HUNSPELL_ENGINE_NAME
 
-    # 1) phunspell
+    # 1) phunspell HU
     try:
         import phunspell  # type: ignore
 
@@ -50,7 +55,7 @@ def _try_init_hunspell() -> None:
     except Exception:
         pass
 
-    # 2) hunspell binding (needs aff/dic files)
+    # 2) hunspell binding HU
     try:
         from hunspell import HunSpell  # type: ignore
 
@@ -66,8 +71,41 @@ def _try_init_hunspell() -> None:
         return
 
 
+def _try_init_hunspell_en() -> None:
+    """
+    English hunspell init (optional) for word-level EN check.
+    Prefer phunspell(en_US). Fallback hunspell binding if dict found.
+    """
+    global _HUNSPELL_EN_AVAILABLE, _HUNSPELL_EN_ENGINE, _HUNSPELL_EN_ENGINE_NAME
+
+    # 1) phunspell EN
+    try:
+        import phunspell  # type: ignore
+
+        _HUNSPELL_EN_ENGINE = phunspell.Phunspell("en_US")
+        _HUNSPELL_EN_AVAILABLE = True
+        _HUNSPELL_EN_ENGINE_NAME = "phunspell(en_US)"
+        return
+    except Exception:
+        pass
+
+    # 2) hunspell binding EN
+    try:
+        from hunspell import HunSpell  # type: ignore
+
+        aff_dic = _find_hunspell_files("en_US")
+        if aff_dic is None:
+            return
+        aff, dic = aff_dic
+        _HUNSPELL_EN_ENGINE = HunSpell(str(dic), str(aff))
+        _HUNSPELL_EN_AVAILABLE = True
+        _HUNSPELL_EN_ENGINE_NAME = f"hunspell({dic.name})"
+        return
+    except Exception:
+        return
+
+
 def _find_hunspell_files(lang: str) -> Optional[Tuple[Path, Path]]:
-    # Common locations (Linux/macOS custom). Windows users can pass files next to script or cwd.
     candidates = [
         Path.cwd(),
         Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd(),
@@ -85,20 +123,39 @@ def _find_hunspell_files(lang: str) -> Optional[Tuple[Path, Path]]:
 
 
 def hunspell_lookup(word: str) -> bool:
+    """HU lookup."""
     if not _HUNSPELL_AVAILABLE or _HUNSPELL_ENGINE is None:
         return False
 
-    # phunspell: .lookup(str)->bool
     if hasattr(_HUNSPELL_ENGINE, "lookup"):
         try:
             return bool(_HUNSPELL_ENGINE.lookup(word))
         except Exception:
             return False
 
-    # hunspell binding: .spell(str)->bool
     if hasattr(_HUNSPELL_ENGINE, "spell"):
         try:
             return bool(_HUNSPELL_ENGINE.spell(word))
+        except Exception:
+            return False
+
+    return False
+
+
+def hunspell_en_lookup(word: str) -> bool:
+    """EN lookup (optional)."""
+    if not _HUNSPELL_EN_AVAILABLE or _HUNSPELL_EN_ENGINE is None:
+        return False
+
+    if hasattr(_HUNSPELL_EN_ENGINE, "lookup"):
+        try:
+            return bool(_HUNSPELL_EN_ENGINE.lookup(word))
+        except Exception:
+            return False
+
+    if hasattr(_HUNSPELL_EN_ENGINE, "spell"):
+        try:
+            return bool(_HUNSPELL_EN_ENGINE.spell(word))
         except Exception:
             return False
 
@@ -115,6 +172,8 @@ WORD_RE = re.compile(r"[^\W\d_]+", flags=re.UNICODE)  # unicode letters only
 
 # CJK/Hangul/Kana detection
 CJK_RE = re.compile(r"[\u4E00-\u9FFF\u3400-\u4DBF\u3040-\u30FF\uAC00-\uD7AF]")
+
+HU_DIACRITICS_RE = re.compile(r"[áéíóöőúüűÁÉÍÓÖŐÚÜŰ]")
 
 
 def clean_for_lang(text: str) -> str:
@@ -209,7 +268,7 @@ def detect_top_lang(text: str) -> Optional[Tuple[str, float]]:
 
 
 # ============================
-# Hunspell score
+# Hunspell HU score
 # ============================
 def hunspell_hu_ratio(text: str, min_word_len: int = 3) -> Optional[float]:
     """
@@ -226,11 +285,9 @@ def hunspell_hu_ratio(text: str, min_word_len: int = 3) -> Optional[float]:
 
     ok = 0
     for w in words:
-        # try word as-is
         if hunspell_lookup(w):
             ok += 1
             continue
-        # try a simple de-hyphenation split (common in exports)
         if "-" in w:
             parts = [p for p in w.split("-") if p]
             if parts and all(hunspell_lookup(p) for p in parts):
@@ -240,7 +297,137 @@ def hunspell_hu_ratio(text: str, min_word_len: int = 3) -> Optional[float]:
 
 
 # ============================
-# Decisions
+# szotar.txt (HU/IDEGEN)
+# ============================
+DICT_HU_HEADER = "[HU]"
+DICT_FOREIGN_HEADER = "[IDEGEN]"
+
+
+def load_szotar(path: Path) -> Tuple[Set[str], Set[str]]:
+    if not path.exists():
+        return set(), set()
+
+    hu: Set[str] = set()
+    foreign: Set[str] = set()
+
+    section = ""
+    for ln in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        up = s.upper()
+        if up == DICT_HU_HEADER:
+            section = "HU"
+            continue
+        if up == DICT_FOREIGN_HEADER:
+            section = "FOREIGN"
+            continue
+
+        w = s.lower()
+        if not w:
+            continue
+        if section == "HU":
+            hu.add(w)
+        elif section == "FOREIGN":
+            foreign.add(w)
+        else:
+            # If file starts without header, default HU
+            hu.add(w)
+
+    return hu, foreign
+
+
+def save_szotar(path: Path, hu: Set[str], foreign: Set[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines: List[str] = []
+    lines.append(f"# szotar.txt autogenerated | {now}\n")
+    lines.append(f"{DICT_HU_HEADER}\n")
+    for w in sorted(hu):
+        lines.append(w + "\n")
+    lines.append("\n")
+    lines.append(f"{DICT_FOREIGN_HEADER}\n")
+    for w in sorted(foreign):
+        lines.append(w + "\n")
+    path.write_text("".join(lines), encoding="utf-8")
+
+
+class SzotarStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.hu, self.foreign = load_szotar(path)
+        self._dirty = False
+
+    def save_if_dirty(self) -> None:
+        if self._dirty:
+            save_szotar(self.path, self.hu, self.foreign)
+            self._dirty = False
+
+    def add_hu(self, w: str) -> None:
+        w = w.lower()
+        if w not in self.hu:
+            self.hu.add(w)
+            self._dirty = True
+
+    def add_foreign(self, w: str) -> None:
+        w = w.lower()
+        if w not in self.foreign:
+            self.foreign.add(w)
+            self._dirty = True
+
+    def contains_any(self, w: str) -> bool:
+        w = w.lower()
+        return (w in self.hu) or (w in self.foreign)
+
+
+# ============================
+# Word-level English detection helper
+# ============================
+def is_probably_english_word(word: str, en_word_prob: float) -> bool:
+    """
+    1) If contains Hungarian diacritics => treat NOT English.
+    2) Prefer hunspell EN if available.
+    3) Else langdetect on the single word (best-effort).
+    """
+    w = word.strip()
+    if not w:
+        return False
+    if HU_DIACRITICS_RE.search(w):
+        return False
+
+    wl = w.lower()
+
+    if _HUNSPELL_EN_AVAILABLE and hunspell_en_lookup(wl):
+        return True
+
+    if _LANGDETECT_AVAILABLE and detect_langs is not None and len(wl) >= 4:
+        try:
+            langs = detect_langs(wl)
+        except Exception:
+            return False
+        if not langs:
+            return False
+        top = langs[0]
+        lang = getattr(top, "lang", "")
+        prob = float(getattr(top, "prob", 0.0))
+        return (lang == "en") and (prob >= en_word_prob)
+
+    return False
+
+
+# ============================
+# Ratios against szotar sets
+# ============================
+def ratio_in_set(words: List[str], s: Set[str], min_len: int) -> float:
+    eligible = [w for w in words if len(w) >= min_len]
+    if not eligible:
+        return 0.0
+    hit = sum(1 for w in eligible if w in s)
+    return hit / len(eligible)
+
+
+# ============================
+# Decisions (item-level)
 # ============================
 @dataclass
 class Decision:
@@ -276,7 +463,6 @@ def decide_langdetect_then_hunspell(
     if has_cjk(cleaned):
         return Decision(True, 0.0, "", 0.0, 0.0, prev, kind, "cjk")
 
-    # If extremely short, langdetect can be noisy; still try both then fall back.
     ld_hu = 0.0
     ld_top_lang = ""
     ld_top_prob = 0.0
@@ -289,30 +475,24 @@ def decide_langdetect_then_hunspell(
         if top is not None:
             ld_top_lang, ld_top_prob = top
 
-        # 1) primary: langdetect says HU strongly
         if ld_hu >= ld_hu_threshold:
             return Decision(False, ld_hu, ld_top_lang, ld_top_prob, 0.0, prev, kind, "hu_langdetect")
 
-    # 2) fallback: hunspell ratio
     hs = hunspell_hu_ratio(cleaned, min_word_len=hunspell_min_word_len)
     hs_hu = float(hs) if hs is not None else 0.0
 
     if hs is not None and hs_hu >= hunspell_threshold:
         return Decision(False, ld_hu, ld_top_lang, ld_top_prob, hs_hu, prev, kind, "hu_hunspell")
 
-    # ask/ask_zero behavior (optional)
-    # ask_zero: no evidence (langdetect ~0 AND hunspell ~0) OR too few words
     too_short = len([w for w in words if len(w) >= hunspell_min_word_len]) < min_words
     if (ld_hu <= zero_eps and hs_hu <= zero_eps) or too_short:
         return Decision(False, ld_hu, ld_top_lang, ld_top_prob, hs_hu, prev, kind, "ask_zero")
 
-    # ask: near thresholds
     near_ld = (ld_hu_threshold - margin) <= ld_hu < ld_hu_threshold
     near_hs = (hunspell_threshold - margin) <= hs_hu < hunspell_threshold
     if near_ld or near_hs:
         return Decision(False, ld_hu, ld_top_lang, ld_top_prob, hs_hu, prev, kind, "ask")
 
-    # otherwise delete
     if ld_top_lang and ld_top_prob >= ld_any_threshold and ld_top_lang != "hu":
         return Decision(True, ld_hu, ld_top_lang, ld_top_prob, hs_hu, prev, kind, f"langdetect_{ld_top_lang}")
 
@@ -323,11 +503,11 @@ def handle_prompt(dec: Decision, noask: bool) -> bool:
     """
     Returns delete? bool
     --noask:
-      ask_zero => DELETE (because user requested: if none recognized => delete)
-      ask => DELETE
+      ask_zero => DELETE
+      ask      => DELETE
     """
     if noask:
-        return True  # both ask / ask_zero -> delete
+        return True
 
     if dec.reason == "ask_zero":
         print("\n[ASK_ZERO] Nem megbízható / túl rövid / nincs elég bizonyíték -> kézi döntés.")
@@ -344,6 +524,241 @@ def handle_prompt(dec: Decision, noask: bool) -> bool:
     if ans == "y":
         return False
     return True
+
+
+# ============================
+# Sentence-level filtering (EN + szotar)
+# ============================
+@dataclass
+class SentDecision:
+    keep: bool
+    reason: str
+    en_prob: float
+    top_lang: str
+    top_prob: float
+    foreign_ratio: float
+    hu_ratio: float
+    preview: str
+
+
+def decide_sentence(
+    sentence: str,
+    ld_any_threshold: float,
+    en_sentence_threshold: float,
+    margin: float,
+    dict_foreign_threshold: float,
+    dict_hu_threshold: float,
+    dict_min_word_len: int,
+    szotar: SzotarStore,
+) -> SentDecision:
+    prev = make_preview(sentence)
+    cleaned = clean_for_lang(sentence)
+
+    if not cleaned:
+        return SentDecision(True, "empty", 0.0, "", 0.0, 0.0, 0.0, prev)
+
+    if has_cjk(cleaned):
+        return SentDecision(False, "cjk", 0.0, "", 0.0, 0.0, 0.0, prev)
+
+    words = tokenize_words(cleaned)
+
+    foreign_ratio = ratio_in_set(words, szotar.foreign, dict_min_word_len)
+    if foreign_ratio >= dict_foreign_threshold:
+        return SentDecision(False, "idegen_list", 0.0, "", 0.0, foreign_ratio, 0.0, prev)
+
+    hu_ratio = ratio_in_set(words, szotar.hu, dict_min_word_len)
+    if hu_ratio >= dict_hu_threshold:
+        # Keep strongly supported by szotar HU list
+        return SentDecision(True, "kept_bc_szotar", 0.0, "", 0.0, foreign_ratio, hu_ratio, prev)
+
+    # English detection (langdetect) – best-effort
+    en_prob = 0.0
+    top_lang = ""
+    top_prob = 0.0
+
+    if _LANGDETECT_AVAILABLE and detect_langs is not None:
+        r = _lang_prob_ratio_langdetect(cleaned, "en")
+        en_prob = float(r) if r is not None else 0.0
+        top = detect_top_lang(cleaned)
+        if top is not None:
+            top_lang, top_prob = top
+
+        strong_en = (en_prob >= en_sentence_threshold) or (top_lang == "en" and top_prob >= ld_any_threshold)
+        if strong_en:
+            return SentDecision(False, "en_strong", en_prob, top_lang, top_prob, foreign_ratio, hu_ratio, prev)
+
+        near_en = ((en_sentence_threshold - margin) <= en_prob < en_sentence_threshold) or (
+            top_lang == "en" and (ld_any_threshold - margin) <= top_prob < ld_any_threshold
+        )
+        if near_en:
+            return SentDecision(True, "en_ambiguous_ask", en_prob, top_lang, top_prob, foreign_ratio, hu_ratio, prev)
+
+    return SentDecision(True, "keep", en_prob, top_lang, top_prob, foreign_ratio, hu_ratio, prev)
+
+
+def prompt_keep_ambiguous_sentence(sd: SentDecision, kind: str, noask: bool) -> bool:
+    """
+    sd.reason == en_ambiguous_ask -> ask user.
+    y = keep, otherwise delete
+    """
+    if noask:
+        return False
+
+    print("\n[AMBIGUOUS EN] Küszöb alatt / közelében -> kézi döntés.")
+    print(
+        f"Kind: {kind} | en_prob={sd.en_prob:.6f} | top={sd.top_lang}:{sd.top_prob:.3f} | "
+        f"foreign_ratio={sd.foreign_ratio:.3f} | hu_ratio={sd.hu_ratio:.3f}"
+    )
+    print(f"Preview: {sd.preview}")
+    ans = input("Döntés? (y=megtart, n/Enter=töröl) [y/N]: ").strip().lower()
+    return ans == "y"
+
+
+def collect_words_to_szotar(
+    sentence: str,
+    szotar: SzotarStore,
+    dict_collect_min_word_len: int,
+    en_word_prob: float,
+    noask: bool,
+) -> None:
+    """
+    If user kept an ambiguous sentence, optionally collect NEW words.
+    - Only words not in HU/IDEGEN.
+    - Skip words already recognized by HU hunspell (if available).
+    - For each word:
+        - If looks English (EN hunspell or langdetect word) => ask to add to IDEGEN.
+        - Else ask: add to HU? (Enter/y=igen, n=IDEGEN, s=skip)
+    """
+    if noask:
+        return
+
+    cleaned = clean_for_lang(sentence)
+    words = tokenize_words(cleaned)
+    words = [w for w in words if len(w) >= dict_collect_min_word_len]
+    if not words:
+        return
+
+    # unique in order
+    seen: Set[str] = set()
+    ordered: List[str] = []
+    for w in words:
+        if w not in seen:
+            seen.add(w)
+            ordered.append(w)
+
+    changed = False
+
+    for w in ordered:
+        if szotar.contains_any(w):
+            continue
+
+        # If HU hunspell knows it, no need to store (it is already "HU enough")
+        if _HUNSPELL_AVAILABLE and hunspell_lookup(w):
+            continue
+
+        if is_probably_english_word(w, en_word_prob=en_word_prob):
+            ans = input(f"'{w}' angolnak tűnik. IDEGEN listába tegyem? (Enter/y=igen, n=nem) [Y/n]: ").strip().lower()
+            if ans in {"", "y"}:
+                szotar.add_foreign(w)
+                changed = True
+            continue
+
+        ans2 = input(f"Új szó: '{w}' | HU szótárba? (Enter/y=igen, n=IDEGEN, s=skip) [Y/n/s]: ").strip().lower()
+        if ans2 in {"", "y"}:
+            szotar.add_hu(w)
+            changed = True
+        elif ans2 == "n":
+            szotar.add_foreign(w)
+            changed = True
+        else:
+            # skip
+            pass
+
+    if changed:
+        szotar.save_if_dirty()
+
+
+def filter_text_sentences(
+    text: str,
+    *,
+    context_kind: str,
+    file_name: str,
+    show_deleted: bool,
+    noask: bool,
+    ld_any_threshold: float,
+    en_sentence_threshold: float,
+    margin: float,
+    dict_foreign_threshold: float,
+    dict_hu_threshold: float,
+    dict_min_word_len: int,
+    dict_collect_min_word_len: int,
+    en_word_prob: float,
+    szotar: SzotarStore,
+) -> str:
+    """
+    Split to sentence-like chunks. Remove:
+      - strong English chunks
+      - chunks dominated by IDEGEN words
+    Keep + print:
+      - chunks dominated by HU szotar words -> print "KEPT, bc szotar.txt"
+    Ask:
+      - near English threshold -> y keeps + triggers word collection.
+    """
+    chunks = split_into_chunks(text)
+    if not chunks:
+        return text
+
+    kept: List[str] = []
+
+    for ch in chunks:
+        sd = decide_sentence(
+            ch,
+            ld_any_threshold=ld_any_threshold,
+            en_sentence_threshold=en_sentence_threshold,
+            margin=margin,
+            dict_foreign_threshold=dict_foreign_threshold,
+            dict_hu_threshold=dict_hu_threshold,
+            dict_min_word_len=dict_min_word_len,
+            szotar=szotar,
+        )
+
+        if sd.reason == "kept_bc_szotar":
+            print(f"[KEPT, bc szotar.txt] {file_name} | {context_kind} | hu_ratio={sd.hu_ratio:.3f} | {sd.preview}")
+            kept.append(ch)
+            continue
+
+        if sd.reason == "en_ambiguous_ask":
+            keep_it = prompt_keep_ambiguous_sentence(sd, kind=f"{file_name} | {context_kind}", noask=noask)
+            if keep_it:
+                kept.append(ch)
+                # collect words from this sentence
+                collect_words_to_szotar(
+                    ch,
+                    szotar=szotar,
+                    dict_collect_min_word_len=dict_collect_min_word_len,
+                    en_word_prob=en_word_prob,
+                    noask=noask,
+                )
+            else:
+                if show_deleted:
+                    print(
+                        f"[DELETED_SENT] {file_name} | {context_kind} | reason=en_ambiguous_user_delete | "
+                        f"en_prob={sd.en_prob:.3f} top={sd.top_lang}:{sd.top_prob:.3f} | {sd.preview}"
+                    )
+            continue
+
+        if not sd.keep:
+            if show_deleted:
+                print(
+                    f"[DELETED_SENT] {file_name} | {context_kind} | reason={sd.reason} | "
+                    f"en_prob={sd.en_prob:.3f} top={sd.top_lang}:{sd.top_prob:.3f} | "
+                    f"foreign_ratio={sd.foreign_ratio:.3f} hu_ratio={sd.hu_ratio:.3f} | {sd.preview}"
+                )
+            continue
+
+        kept.append(ch)
+
+    return "\n".join(kept).strip()
 
 
 # ============================
@@ -482,6 +897,192 @@ def extract_subreddit_comment_text(comment_block: str) -> str:
     return "\n".join(content_lines).strip()
 
 
+def rewrite_post_pre_block(
+    pre_block: str,
+    *,
+    file_name: str,
+    show_deleted: bool,
+    noask: bool,
+    ld_any_threshold: float,
+    en_sentence_threshold: float,
+    margin: float,
+    dict_foreign_threshold: float,
+    dict_hu_threshold: float,
+    dict_min_word_len: int,
+    dict_collect_min_word_len: int,
+    en_word_prob: float,
+    szotar: SzotarStore,
+) -> str:
+    """
+    Rewrite title and body in the pre_block by removing EN/IDEGEN-dominated sentences.
+    Keeps original structure lines; rewrites:
+      - "by X: <title>"
+      - body content lines (under "  body :")
+    """
+    lines = pre_block.splitlines(keepends=True)
+    out: List[str] = []
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+
+        # byline
+        m = BYLINE_RE.match(line.strip())
+        if m:
+            user = m.group(1)
+            title = m.group(2)
+            new_title = filter_text_sentences(
+                title,
+                context_kind="PostTitle",
+                file_name=file_name,
+                show_deleted=show_deleted,
+                noask=noask,
+                ld_any_threshold=ld_any_threshold,
+                en_sentence_threshold=en_sentence_threshold,
+                margin=margin,
+                dict_foreign_threshold=dict_foreign_threshold,
+                dict_hu_threshold=dict_hu_threshold,
+                dict_min_word_len=dict_min_word_len,
+                dict_collect_min_word_len=dict_collect_min_word_len,
+                en_word_prob=en_word_prob,
+                szotar=szotar,
+            )
+            eol = "\n" if line.endswith("\n") else ""
+            out.append(f"by {user}: {new_title}{eol}")
+            i += 1
+            continue
+
+        # body
+        if BODY_START_RE.match(line):
+            out.append(line)
+            i += 1
+            body_lines: List[str] = []
+            while i < len(lines) and (not COMMENT_START_RE.match(lines[i])):
+                body_lines.append(lines[i])
+                i += 1
+
+            # extract raw body text from indented lines
+            raw_body_parts: List[str] = []
+            for bl in body_lines:
+                txt = bl[4:] if bl.startswith("    ") else bl.lstrip()
+                raw_body_parts.append(txt.rstrip("\n"))
+            raw_body = "\n".join(raw_body_parts).strip()
+
+            new_body = filter_text_sentences(
+                raw_body,
+                context_kind="PostBody",
+                file_name=file_name,
+                show_deleted=show_deleted,
+                noask=noask,
+                ld_any_threshold=ld_any_threshold,
+                en_sentence_threshold=en_sentence_threshold,
+                margin=margin,
+                dict_foreign_threshold=dict_foreign_threshold,
+                dict_hu_threshold=dict_hu_threshold,
+                dict_min_word_len=dict_min_word_len,
+                dict_collect_min_word_len=dict_collect_min_word_len,
+                en_word_prob=en_word_prob,
+                szotar=szotar,
+            )
+
+            if new_body.strip():
+                for ln in new_body.splitlines():
+                    out.append("    " + ln.rstrip() + "\n")
+
+            continue
+
+        out.append(line)
+        i += 1
+
+    return "".join(out)
+
+
+def rewrite_comment_block(
+    comment_block: str,
+    *,
+    file_name: str,
+    show_deleted: bool,
+    noask: bool,
+    ld_any_threshold: float,
+    en_sentence_threshold: float,
+    margin: float,
+    dict_foreign_threshold: float,
+    dict_hu_threshold: float,
+    dict_min_word_len: int,
+    dict_collect_min_word_len: int,
+    en_word_prob: float,
+    szotar: SzotarStore,
+) -> Optional[str]:
+    """
+    Rewrite comment text lines by removing EN/IDEGEN-dominated sentences.
+    Tries to preserve "author:" prefix from the first content line.
+    Returns None if comment becomes empty (=> delete the entire comment block).
+    """
+    lines = comment_block.splitlines(keepends=True)
+    if not lines:
+        return comment_block
+
+    # find the comment start line index
+    start_idx = None
+    for i, l in enumerate(lines):
+        if COMMENT_START_RE.match(l):
+            start_idx = i
+            break
+    if start_idx is None:
+        return comment_block
+
+    # find first content line after comment:
+    first_content_idx = None
+    author_prefix = ""
+    for j in range(start_idx + 1, len(lines)):
+        raw = lines[j]
+        stripped = (raw[4:] if raw.startswith("    ") else raw.lstrip()).rstrip("\n")
+        if stripped.strip() == "":
+            continue
+        first_content_idx = j
+        if ":" in stripped:
+            author = stripped.split(":", 1)[0].strip()
+            author_prefix = author + ":"
+        break
+
+    comment_text = extract_subreddit_comment_text(comment_block)
+    new_text = filter_text_sentences(
+        comment_text,
+        context_kind="CommentBody",
+        file_name=file_name,
+        show_deleted=show_deleted,
+        noask=noask,
+        ld_any_threshold=ld_any_threshold,
+        en_sentence_threshold=en_sentence_threshold,
+        margin=margin,
+        dict_foreign_threshold=dict_foreign_threshold,
+        dict_hu_threshold=dict_hu_threshold,
+        dict_min_word_len=dict_min_word_len,
+        dict_collect_min_word_len=dict_collect_min_word_len,
+        en_word_prob=en_word_prob,
+        szotar=szotar,
+    )
+
+    if not new_text.strip():
+        return None
+
+    new_lines: List[str] = []
+    # keep the "  comment :" line (and any lines up to it)
+    new_lines.extend(lines[: start_idx + 1])
+
+    text_lines = new_text.splitlines()
+    if author_prefix:
+        first_line = text_lines[0] if text_lines else ""
+        new_lines.append("    " + author_prefix + ((" " + first_line) if first_line else "") + "\n")
+        for ln in text_lines[1:]:
+            new_lines.append("    " + ln.rstrip() + "\n")
+    else:
+        for ln in text_lines:
+            new_lines.append("    " + ln.rstrip() + "\n")
+
+    return "".join(new_lines)
+
+
 def process_file_subreddits(
     in_path: Path,
     out_path: Path,
@@ -497,6 +1098,14 @@ def process_file_subreddits(
     noask: bool,
     dry_run: bool,
     force_heuristic: bool,
+    # NEW: sentence EN/DICT filtering
+    en_sentence_threshold: float,
+    dict_foreign_threshold: float,
+    dict_hu_threshold: float,
+    dict_min_word_len: int,
+    dict_collect_min_word_len: int,
+    en_word_prob: float,
+    szotar: SzotarStore,
 ) -> Tuple[int, int]:
     raw = in_path.read_text(encoding="utf-8", errors="replace")
     segs = split_posts_subreddit(raw)
@@ -512,7 +1121,7 @@ def process_file_subreddits(
 
         pre, comments = split_post_into_pre_and_comments(block)
 
-        # POST
+        # POST (item-level keep/delete)
         total += 1
         post_text = extract_subreddit_post_text(pre)
         post_dec = decide_langdetect_then_hunspell(
@@ -533,7 +1142,6 @@ def process_file_subreddits(
         else:
             delete_post = post_dec.delete
 
-        # optional confirm for non-ambiguous deletions
         if delete_post and (not noask) and confirm_all_deletions and (post_dec.reason not in {"ask", "ask_zero"}):
             print(
                 f"\n[{in_path.name}] Candidate DELETE: Post | ld_hu={post_dec.ld_hu:.6f} | "
@@ -562,7 +1170,31 @@ def process_file_subreddits(
             deleted += 1
             continue
 
-        kept.append(pre)
+        # NEW: rewrite title/body inside pre by removing EN/IDEGEN-dominated sentences
+        new_pre = rewrite_post_pre_block(
+            pre,
+            file_name=in_path.name,
+            show_deleted=show_deleted,
+            noask=noask,
+            ld_any_threshold=ld_any_threshold,
+            en_sentence_threshold=en_sentence_threshold,
+            margin=margin,
+            dict_foreign_threshold=dict_foreign_threshold,
+            dict_hu_threshold=dict_hu_threshold,
+            dict_min_word_len=dict_min_word_len,
+            dict_collect_min_word_len=dict_collect_min_word_len,
+            en_word_prob=en_word_prob,
+            szotar=szotar,
+        )
+
+        # If post became empty-ish (no title+no body), delete it
+        if not extract_subreddit_post_text(new_pre).strip():
+            if show_deleted:
+                print(f"[DELETED] {in_path.name} | Post | reason=post_became_empty_after_sentence_filter")
+            deleted += 1
+            continue
+
+        kept.append(new_pre)
 
         # COMMENTS
         for c in comments:
@@ -612,8 +1244,31 @@ def process_file_subreddits(
 
             if delete_c:
                 deleted += 1
+                continue
+
+            # NEW: rewrite comment by removing EN/IDEGEN-dominated sentences
+            new_c = rewrite_comment_block(
+                c,
+                file_name=in_path.name,
+                show_deleted=show_deleted,
+                noask=noask,
+                ld_any_threshold=ld_any_threshold,
+                en_sentence_threshold=en_sentence_threshold,
+                margin=margin,
+                dict_foreign_threshold=dict_foreign_threshold,
+                dict_hu_threshold=dict_hu_threshold,
+                dict_min_word_len=dict_min_word_len,
+                dict_collect_min_word_len=dict_collect_min_word_len,
+                en_word_prob=en_word_prob,
+                szotar=szotar,
+            )
+
+            if new_c is None:
+                if show_deleted:
+                    print(f"[DELETED] {in_path.name} | Comment | reason=comment_became_empty_after_sentence_filter")
+                deleted += 1
             else:
-                kept.append(c)
+                kept.append(new_c)
 
     if not dry_run:
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -639,9 +1294,10 @@ def is_under(path: Path, parent: Path) -> bool:
 
 def main() -> int:
     _try_init_hunspell()
+    _try_init_hunspell_en()
 
     p = argparse.ArgumentParser(
-        description="Filter Reddit exports: keep HU via langdetect, fallback to Hunspell, else delete; visited + backups."
+        description="Filter Reddit exports: keep HU via langdetect, fallback to Hunspell; sentence-level EN removal + szotar HU/IDEGEN."
     )
     p.add_argument("--version", action="version", version=VERSION)
 
@@ -649,15 +1305,15 @@ def main() -> int:
     p.add_argument("--pattern", default="*.txt", help="Glob pattern for files (default: *.txt).")
     p.add_argument("--recursive", action="store_true", help="Process subfolders too.")
 
-    # Detection thresholds
+    # Item-level HU thresholds
     p.add_argument("--ld-hu-threshold", "--threshold", dest="ld_hu_threshold", type=float, default=0.70,
-                   help="Keep if langdetect HU probability >= this.")
+                   help="Keep item if langdetect HU probability >= this.")
     p.add_argument("--ld-any-threshold", type=float, default=0.70,
                    help="If langdetect top prob >= this and not HU, reason will be langdetect_xx.")
-    p.add_argument("--hunspell-threshold", "--stopwords-threshold", dest="hunspell_threshold", type=float, default=0.55,
-                   help="Keep if Hunspell HU word ratio >= this.")
+    p.add_argument("--hunspell-threshold", dest="hunspell_threshold", type=float, default=0.55,
+                   help="Keep item if Hunspell HU word ratio >= this.")
 
-    # Ambiguity handling (optional prompts)
+    # Ambiguity handling (item-level)
     p.add_argument("--margin", type=float, default=0.10, help="Near-threshold band that triggers ask.")
     p.add_argument("--zero-eps", type=float, default=0.02, help="Near-zero evidence threshold for ask_zero.")
     p.add_argument("--min-words", type=int, default=4, help="If too few words, treat as ask_zero.")
@@ -668,14 +1324,31 @@ def main() -> int:
     p.add_argument("--inplace", action="store_true")
     p.add_argument("--outputfolder", default=None)
 
-    # kept for compatibility with your earlier CLI; no effect in this version
+    # kept for compatibility
     p.add_argument("--force-heuristic", action="store_true")
 
     p.add_argument("--subreddits", action="store_true")
 
     p.add_argument("--ask", action="store_true")
     p.add_argument("--noask", action="store_true",
-                   help="Disable ALL prompts. ask_zero/ask => DELETE (per your request).")
+                   help="Disable ALL prompts. item ask/ask_zero => DELETE; ambiguous EN sentence => DELETE; no szotar collection.")
+
+    # NEW: sentence-level EN removal
+    p.add_argument("--en-sent-threshold", type=float, default=0.70,
+                   help="Delete sentence if EN probability >= this (langdetect).")
+    # NEW: szotar thresholds
+    p.add_argument("--szotar-file", type=str, default="szotar.txt",
+                   help="Path to szotar.txt containing [HU] and [IDEGEN] sections.")
+    p.add_argument("--dict-foreign-threshold", type=float, default=0.35,
+                   help="Delete sentence if IDEGEN words ratio >= this.")
+    p.add_argument("--dict-hu-threshold", type=float, default=0.35,
+                   help="If HU szotar words ratio >= this, print: KEPT, bc szotar.txt.")
+    p.add_argument("--dict-min-word-len", type=int, default=1,
+                   help="Min word length for sentence HU/IDEGEN ratio computations.")
+    p.add_argument("--dict-collect-min-word-len", type=int, default=4,
+                   help="Min word length for collecting new words into szotar from kept ambiguous sentences.")
+    p.add_argument("--en-word-prob", type=float, default=0.80,
+                   help="If no EN hunspell, langdetect(word) >= this => treat as English word.")
 
     args = p.parse_args()
 
@@ -694,19 +1367,28 @@ def main() -> int:
 
     detector_info = "langdetect" if _LANGDETECT_AVAILABLE and not args.force_heuristic else "langdetect(unavailable)"
     hunspell_info = _HUNSPELL_ENGINE_NAME if _HUNSPELL_AVAILABLE else "hunspell(unavailable)"
+    hunspell_en_info = _HUNSPELL_EN_ENGINE_NAME if _HUNSPELL_EN_AVAILABLE else "hunspell_en(unavailable)"
+
+    szotar_path = Path(args.szotar_file).expanduser().resolve()
+    szotar = SzotarStore(szotar_path)
 
     print(f"Version: {VERSION}")
     print(
-        f"Detectors: {detector_info} -> {hunspell_info} | "
+        f"Detectors: {detector_info} -> {hunspell_info} | EN-word: {hunspell_en_info} | "
         f"ld_hu_threshold={args.ld_hu_threshold:.2f} | hunspell_threshold={args.hunspell_threshold:.2f} | "
-        f"margin={args.margin:.2f} | zero_eps={args.zero_eps:.6f} | subreddits={args.subreddits}"
+        f"margin={args.margin:.2f} | en_sent_threshold={args.en_sent_threshold:.2f} | "
+        f"dict_foreign_threshold={args.dict_foreign_threshold:.2f} | dict_hu_threshold={args.dict_hu_threshold:.2f} | "
+        f"subreddits={args.subreddits}"
     )
     print(f"Visited file (root): {visited_path} | entries={len(visited)}")
+    print(f"Szotar: {szotar_path} | HU={len(szotar.hu)} | IDEGEN={len(szotar.foreign)}")
 
     if not _LANGDETECT_AVAILABLE:
-        print("WARN: langdetect not available. HU detection will rely on Hunspell only.")
+        print("WARN: langdetect not available. Sentence EN detection will be limited.")
     if not _HUNSPELL_AVAILABLE:
-        print("WARN: Hunspell not available. Fallback step is disabled (install phunspell or hunspell + hu_HU dict).")
+        print("WARN: HU Hunspell not available. Item-level fallback is disabled (install phunspell or hunspell + hu_HU dict).")
+    if not _HUNSPELL_EN_AVAILABLE:
+        print("INFO: EN Hunspell not available. Word-level EN check falls back to langdetect(word) when possible.")
 
     files_all = iter_files(in_dir, args.recursive, args.pattern)
 
@@ -754,9 +1436,16 @@ def main() -> int:
                     noask=args.noask,
                     dry_run=args.dry_run,
                     force_heuristic=args.force_heuristic,
+                    en_sentence_threshold=args.en_sent_threshold,
+                    dict_foreign_threshold=args.dict_foreign_threshold,
+                    dict_hu_threshold=args.dict_hu_threshold,
+                    dict_min_word_len=args.dict_min_word_len,
+                    dict_collect_min_word_len=args.dict_collect_min_word_len,
+                    en_word_prob=args.en_word_prob,
+                    szotar=szotar,
                 )
             else:
-                raise RuntimeError("This v9 code focuses on --subreddits mode (as your v7 snippet did).")
+                raise RuntimeError("This v10 code focuses on --subreddits mode (same as your v9).")
 
             grand_total += total
             grand_deleted += deleted
@@ -764,6 +1453,9 @@ def main() -> int:
             if not args.dry_run:
                 append_visited(visited_path, rel_posix)
                 visited.add(rel_posix)
+
+                # ensure szotar persisted
+                szotar.save_if_dirty()
 
         except Exception as e:
             print(f"[ERROR] Failed processing {rel_posix}: {e}")
@@ -775,7 +1467,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-#TODO saját szotar epitese szavakbol, ammiket en valsztopttam, de minden szot elotte nezzunk meg egy masik obijektumorinetalt resszel, ami megmondja, hogy tenyleg angol-e a szo, mert ha igem, akkor nem adjuk hozzá a magyar szotarunkhoz
-#TODO esetleg angol meg mas nyelvfelismerö melle
