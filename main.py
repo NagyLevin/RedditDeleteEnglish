@@ -7,6 +7,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
+from urllib.parse import urlsplit
 
 from langdetect import DetectorFactory, LangDetectException, detect_langs
 
@@ -29,6 +30,12 @@ BY_RE = re.compile(r"^by\s+[^:]+:")
 WORD_RE = re.compile(r"[A-Za-zÁÉÍÓÖŐÚÜŰáéíóöőúüű]+(?:[-'][A-Za-zÁÉÍÓÖŐÚÜŰáéíóöőúüű]+)*")
 URL_RE = re.compile(r"https?://\S+|www\.\S+")
 MENTION_RE = re.compile(r"(?:r/|u/)[A-Za-z0-9_\-]+")
+SUBREDDIT_ONLY_RE = re.compile(r"^\s*r/[A-Za-z0-9_\-]+\s*$", re.IGNORECASE)
+EMOJI_ONLY_RE = re.compile(
+    r"^\s*(?:[\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF\u2600-\u27BF\u200d\uFE0F\U0001F900-\U0001F9FF\U0001FA70-\U0001FAFF]+\s*)+$",
+    re.UNICODE,
+)
+MEDIA_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".tif")
 
 
 @dataclass
@@ -48,6 +55,7 @@ class AnalysisResult:
     lingua_hu: Optional[float]
     word_count: int
     normalized_text: str
+    forced_delete: bool = False
 
 
 class HungarianDetectors:
@@ -201,6 +209,73 @@ def extract_text_from_block(block: Block) -> str:
 
 
 
+def is_emoji_only_text(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return bool(EMOJI_ONLY_RE.fullmatch(stripped))
+
+
+
+def remove_emoji_only_lines(block: Block) -> tuple[Block, list[str]]:
+    if not block.content:
+        return block, []
+
+    removed_lines: list[str] = []
+    new_content: list[str] = []
+
+    for idx, line in enumerate(block.content):
+        stripped = line.strip()
+
+        if block.kind == "comment" and idx == 0:
+            new_content.append(line)
+            continue
+
+        if stripped and is_emoji_only_text(stripped):
+            removed_lines.append(stripped)
+            continue
+
+        new_content.append(line)
+
+    return Block(kind=block.kind, header=list(block.header), content=new_content), removed_lines
+
+
+
+def url_is_direct_media(url: str) -> bool:
+    candidate = url.strip()
+    if candidate.lower().startswith("www."):
+        candidate = "https://" + candidate
+    try:
+        path = urlsplit(candidate).path.lower()
+    except Exception:
+        return False
+    return path.endswith(MEDIA_EXTENSIONS)
+
+
+
+def is_media_only_text(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    urls = URL_RE.findall(stripped)
+    if not urls:
+        return False
+    leftover = URL_RE.sub(" ", stripped)
+    leftover = re.sub(r"\s+", "", leftover)
+    if leftover:
+        return False
+    return all(url_is_direct_media(url) for url in urls)
+
+
+
+def is_subreddit_only_text(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return bool(SUBREDDIT_ONLY_RE.fullmatch(stripped))
+
+
+
 def langdetect_hu_probability(text: str) -> Optional[float]:
     try:
         langs = detect_langs(text)
@@ -258,19 +333,61 @@ def combined_score(lang_score: Optional[float], spell_ratio: Optional[float], li
 
 
 def analyze_text(text: str, detectors: HungarianDetectors, threshold: float) -> AnalysisResult:
-    cleaned = sanitize_text(text)
-    words = tokenize_words(cleaned)
+    raw = text.strip()
 
-    if not cleaned or not words:
+    if is_media_only_text(raw):
         return AnalysisResult(
-            score=1.0,
-            keep=True,
-            reason="Nincs elég értelmezhető szó az ellenőrzéshez, ezért megtartva.",
+            score=0.0,
+            keep=False,
+            reason="azonnali törlés: a blokk csak közvetlen kép/gif link(ek)ből áll",
             langdetect_hu=None,
             phunspell_ratio=None,
             lingua_hu=None,
             word_count=0,
-            normalized_text=cleaned,
+            normalized_text=raw,
+            forced_delete=True,
+        )
+
+    if is_subreddit_only_text(raw):
+        return AnalysisResult(
+            score=0.0,
+            keep=False,
+            reason="azonnali törlés: a blokk csak subreddit hivatkozásból áll",
+            langdetect_hu=None,
+            phunspell_ratio=None,
+            lingua_hu=None,
+            word_count=0,
+            normalized_text=raw,
+            forced_delete=True,
+        )
+
+    if is_emoji_only_text(raw):
+        return AnalysisResult(
+            score=0.0,
+            keep=False,
+            reason="azonnali törlés: a blokk csak emoji(k)ból áll",
+            langdetect_hu=None,
+            phunspell_ratio=None,
+            lingua_hu=None,
+            word_count=0,
+            normalized_text=raw,
+            forced_delete=True,
+        )
+
+    cleaned = sanitize_text(raw)
+    words = tokenize_words(cleaned)
+
+    if not cleaned or not words:
+        return AnalysisResult(
+            score=0.0,
+            keep=False,
+            reason="azonnali törlés: nincs értelmezhető szöveg a blokkban",
+            langdetect_hu=None,
+            phunspell_ratio=None,
+            lingua_hu=None,
+            word_count=0,
+            normalized_text=raw,
+            forced_delete=True,
         )
 
     ldetect = langdetect_hu_probability(cleaned)
@@ -282,7 +399,7 @@ def analyze_text(text: str, detectors: HungarianDetectors, threshold: float) -> 
     parts = [
         f"összpontszám={score:.3f}",
         f"küszöb={threshold:.3f}",
-        f"langdetect.hu={ldetect if ldetect is not None else 'n/a'}", #a detectorok összegének sulyozott átlaga alapjan dönt
+        f"langdetect.hu={ldetect if ldetect is not None else 'n/a'}",
         f"phunspell={ps_ratio if ps_ratio is not None else 'n/a'}",
         f"lingua.hu={linga if linga is not None else 'n/a'}",
         f"szavak={len(words)}",
@@ -319,6 +436,15 @@ def log_decision(action: str, file_path: Path, block: Block, result: AnalysisRes
 
 
 
+def log_line_removal(file_path: Path, block_kind: str, reason: str, line: str) -> None:
+    excerpt = format_excerpt(line)
+    print(
+        f"[SOR TÖRÖLVE] {file_path} | blokk={block_kind} | ok={reason} | sor='{excerpt}'",
+        file=sys.stdout,
+    )
+
+
+
 def rebuild_text(blocks: Iterable[Block]) -> str:
     pieces: list[str] = []
     for block in blocks:
@@ -345,16 +471,20 @@ def process_file(path: Path, out_path: Path, detectors: HungarianDetectors, thre
             kept_blocks.append(block)
             continue
 
+        cleaned_block, removed_lines = remove_emoji_only_lines(block)
+        for removed_line in removed_lines:
+            log_line_removal(path, block.kind, "csak emoji(k)ból álló sor", removed_line)
+
         checked_count += 1
-        result = analyze_text(extract_text_from_block(block), detectors, threshold)
+        result = analyze_text(extract_text_from_block(cleaned_block), detectors, threshold)
 
         if result.keep:
-            kept_blocks.append(block)
+            kept_blocks.append(cleaned_block)
             if show_kept:
-                log_decision("MEGTARTVA", path, block, result)
+                log_decision("MEGTARTVA", path, cleaned_block, result)
         else:
             removed_count += 1
-            log_decision("TÖRÖLVE", path, block, result)
+            log_decision("TÖRÖLVE", path, cleaned_block, result)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(rebuild_text(kept_blocks), encoding="utf-8")
