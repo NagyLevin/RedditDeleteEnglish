@@ -6,8 +6,8 @@ import re
 from pathlib import Path
 
 
-# Unicode-kompatibilis "szó" minta.
-# Betűk/számok számítanak szónak, az aposztrófos és kötőjeles alakokat is egyben tartja.
+# Unicode-kompatibilis szófelismerés
+# A kötőjeles és aposztrófos alakokat egy szónak veszi.
 WORD_RE = re.compile(r"[^\W_]+(?:['’-][^\W_]+)*", re.UNICODE)
 
 TITLE_RE = re.compile(r"^title:\s*(.*)$", re.IGNORECASE)
@@ -29,9 +29,6 @@ def count_file_words(file_path: Path) -> int:
         return 0
 
     total = 0
-
-    # Akkor lesz True, ha egy "comment:" sor után a következő érdemi sor
-    # várhatóan ilyen alakú: "usernev: komment szövege"
     after_comment_marker = False
 
     # Az első sort mindig kihagyjuk
@@ -43,7 +40,7 @@ def count_file_words(file_path: Path) -> int:
 
         lowered = stripped.lower()
 
-        # Csak szerkezeti jelölések, ne számoljuk
+        # Csak szerkezeti elemek, ezeket nem számoljuk
         if lowered == "post:":
             after_comment_marker = False
             continue
@@ -60,23 +57,22 @@ def count_file_words(file_path: Path) -> int:
             after_comment_marker = False
             continue
 
-        # "title: ..." -> csak a kettőspont utáni rész számít
+        # title: -> csak a kettőspont utáni rész számít
         m = TITLE_RE.match(stripped)
         if m:
             total += count_words(m.group(1))
             after_comment_marker = False
             continue
 
-        # "by username: ..." -> csak a kettőspont utáni rész számít
+        # by username: -> csak a kettőspont utáni rész számít
         m = BY_RE.match(stripped)
         if m:
             total += count_words(m.group(1))
             after_comment_marker = False
             continue
 
-        # Ha egy "comment:" után vagyunk, akkor az első ilyen sor:
-        # "usernev: szöveg"
-        # Itt a usernevet nem számoljuk, csak a komment szövegét.
+        # comment: után a következő sorban username: szöveg
+        # Itt csak a kettőspont utáni részt számoljuk
         if after_comment_marker:
             m = ANY_PREFIX_RE.match(stripped)
             if m:
@@ -86,7 +82,7 @@ def count_file_words(file_path: Path) -> int:
             after_comment_marker = False
             continue
 
-        # Minden más normál tartalmi sor, ezt teljes egészében számoljuk
+        # Minden más normál sor teljesen számít
         total += count_words(stripped)
 
     return total
@@ -106,17 +102,25 @@ def process_directory(input_dir: Path, output_file: Path) -> None:
     txt_files = [p for p in txt_files if p.resolve() != output_resolved]
 
     results = []
+    grand_total = 0
+
     for file_path in txt_files:
         word_count = count_file_words(file_path)
         rel_name = file_path.relative_to(input_dir).as_posix()
         results.append((rel_name, word_count))
+        grand_total += word_count
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
     with output_file.open("w", encoding="utf-8", newline="\n") as f:
         for filename, word_count in results:
             f.write(f"{filename}\t{word_count}\n")
 
+        # Két üres sor, majd az összegzés
+        f.write("\n\n")
+        f.write(f"szum:\t{grand_total}\n")
+
     print(f"Feldolgozott fájlok száma: {len(results)}")
+    print(f"Összes szó: {grand_total}")
     print(f"Eredményfájl: {output_file}")
 
 
