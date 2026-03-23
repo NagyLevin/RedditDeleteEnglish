@@ -35,8 +35,22 @@ NUMBER_ONLY_RE = re.compile(
     r"^\s*[+\-]?(?:\d+(?:[.,]\d+)?|[.,]\d+)\s*(?:[%€$£¥])?\s*$",
     re.UNICODE,
 )
-EMOJI_CHAR_CLASS = r"[\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF\u2600-\u27BF\u200d\uFE0F]"
-EMOJI_ONLY_RE = re.compile(rf"^\s*(?:{EMOJI_CHAR_CLASS}+\s*)+$", re.UNICODE)
+
+# KIBŐVÍTETT EMOJI TARTOMÁNYOK
+EMOJI_CHAR_CLASS = (
+    r"["
+    r"\U0001F000-\U0001FAFF"  # Fő emoji blokkok (arcok, tárgyak, állatok stb.)
+    r"\u2600-\u27BF"          # Vegyes szimbólumok és dingbatok (pl. ❤️)
+    r"\u2B00-\u2BFF"          # Nyilak, csillagok (pl. ⭐)
+    r"\u2300-\u23FF"          # Technikai szimbólumok (órák, stb.)
+    r"\u25A0-\u25FF"          # Geometriai formák
+    r"\u200D\uFE0F"           # Zero Width Joiner, Variation Selectors
+    r"]"
+)
+
+# BIZTONSÁGOS (NEM FAGY KI) REGEX
+EMOJI_ONLY_RE = re.compile(rf"^(?:\s|{EMOJI_CHAR_CLASS})+$", re.UNICODE)
+
 PUNCT_ONLY_RE = re.compile(r"^\s*[\W_]+\s*$", re.UNICODE)
 NUMERIC_SYMBOL_ONLY_RE = re.compile(
     r"^\s*[\d\s.,:;!?¿¡+\-*/=×xX%‰€$£¥<>()\[\]{}|\\^~`'\"*_&#@]+\s*$",
@@ -119,7 +133,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-
 def read_text(path: Path) -> str:
     encodings = ("utf-8", "utf-8-sig", "cp1250", "latin-1")
     last_error = None
@@ -137,7 +150,6 @@ def read_text(path: Path) -> str:
     )
 
 
-
 def sanitize_text(text: str) -> str:
     text = MARKDOWN_LINK_RE.sub(" ", text)
     text = URL_RE.sub(" ", text)
@@ -148,15 +160,12 @@ def sanitize_text(text: str) -> str:
     return text
 
 
-
 def tokenize_words(text: str) -> list[str]:
     return [w.lower() for w in WORD_RE.findall(text)]
 
 
-
 def is_block_start(line: str) -> bool:
     return bool(BODY_RE.match(line) or COMMENT_RE.match(line))
-
 
 
 def parse_blocks(text: str) -> list[Block]:
@@ -196,7 +205,6 @@ def parse_blocks(text: str) -> list[Block]:
     return blocks
 
 
-
 def extract_text_from_block(block: Block) -> str:
     if block.kind == "comment":
         if not block.content:
@@ -219,7 +227,6 @@ def extract_text_from_block(block: Block) -> str:
     return " ".join(pieces).strip()
 
 
-
 def langdetect_hu_probability(text: str) -> Optional[float]:
     try:
         langs = detect_langs(text)
@@ -229,7 +236,6 @@ def langdetect_hu_probability(text: str) -> Optional[float]:
         if entry.lang == "hu":
             return float(entry.prob)
     return 0.0
-
 
 
 def phunspell_ratio(words: list[str], spell) -> Optional[float]:
@@ -248,7 +254,6 @@ def phunspell_ratio(words: list[str], spell) -> Optional[float]:
     return valid / len(filtered) if filtered else None
 
 
-
 def lingua_hu_probability(text: str, detector) -> Optional[float]:
     if detector is None or Language is None:
         return None
@@ -256,7 +261,6 @@ def lingua_hu_probability(text: str, detector) -> Optional[float]:
         return float(detector.compute_language_confidence(text, Language.HUNGARIAN))
     except Exception:
         return None
-
 
 
 def combined_score(lang_score: Optional[float], spell_ratio: Optional[float], lingua_score: Optional[float]) -> float:
@@ -275,11 +279,9 @@ def combined_score(lang_score: Optional[float], spell_ratio: Optional[float], li
     return sum(weight * value for weight, value in weighted_parts) / total_weight
 
 
-
 def is_emoji_only_text(text: str) -> bool:
     stripped = text.strip()
     return bool(stripped and EMOJI_ONLY_RE.fullmatch(stripped))
-
 
 
 def is_punct_only_text(text: str) -> bool:
@@ -291,11 +293,9 @@ def is_punct_only_text(text: str) -> bool:
     return bool(PUNCT_ONLY_RE.fullmatch(stripped))
 
 
-
 def is_number_only_text(text: str) -> bool:
     stripped = text.strip()
     return bool(stripped and NUMBER_ONLY_RE.fullmatch(stripped))
-
 
 
 def is_numeric_symbol_only_text(text: str) -> bool:
@@ -309,7 +309,6 @@ def is_numeric_symbol_only_text(text: str) -> bool:
     return bool(NUMERIC_SYMBOL_ONLY_RE.fullmatch(stripped))
 
 
-
 def url_is_direct_media(url: str) -> bool:
     candidate = url.strip()
     if candidate.lower().startswith("www."):
@@ -321,10 +320,8 @@ def url_is_direct_media(url: str) -> bool:
     return path.endswith(MEDIA_EXTENSIONS)
 
 
-
 def normalize_markdown_links(text: str) -> str:
     return MARKDOWN_LINK_RE.sub(lambda m: f" {m.group(2)} ", text)
-
 
 
 def is_link_only_text(text: str) -> bool:
@@ -342,7 +339,6 @@ def is_link_only_text(text: str) -> bool:
     return rest == ""
 
 
-
 def is_media_only_text(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
@@ -356,7 +352,6 @@ def is_media_only_text(text: str) -> bool:
     return rest == "" and all(url_is_direct_media(url) for url in urls)
 
 
-
 def compact_token_for_mention_check(text: str) -> str:
     compact = MARKDOWN_LINK_RE.sub(" ", text)
     compact = re.sub(EMOJI_CHAR_CLASS, "", compact)
@@ -366,14 +361,12 @@ def compact_token_for_mention_check(text: str) -> str:
     return compact
 
 
-
 def is_mention_only_text(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
         return False
     compact = compact_token_for_mention_check(stripped)
     return bool(re.fullmatch(r"(?:r|u)/[A-Za-z0-9_\-]+", compact, flags=re.IGNORECASE))
-
 
 
 def classify_noise_line(text: str) -> Optional[str]:
@@ -387,7 +380,6 @@ def classify_noise_line(text: str) -> Optional[str]:
     if is_numeric_symbol_only_text(stripped):
         return "csak szám+szimbólum sor"
     return None
-
 
 
 def clean_block_lines(block: Block) -> tuple[Block, list[tuple[str, str]]]:
@@ -418,7 +410,6 @@ def clean_block_lines(block: Block) -> tuple[Block, list[tuple[str, str]]]:
         new_content.append(original_line)
 
     return Block(kind=block.kind, header=list(block.header), content=new_content), removed
-
 
 
 def analyze_text(text: str, detectors: HungarianDetectors, threshold: float) -> AnalysisResult:
@@ -577,13 +568,11 @@ def analyze_text(text: str, detectors: HungarianDetectors, threshold: float) -> 
     )
 
 
-
 def format_excerpt(text: str, max_len: int = 120) -> str:
     text = text.replace("\n", " ").strip()
     if len(text) <= max_len:
         return text
     return text[: max_len - 3] + "..."
-
 
 
 def log_line_cleanup(file_path: Path, block_label: str, line_text: str, reason: str) -> None:
@@ -594,7 +583,6 @@ def log_line_cleanup(file_path: Path, block_label: str, line_text: str, reason: 
     )
 
 
-
 def log_decision(action: str, file_path: Path, block_label: str, text_for_excerpt: str, result: AnalysisResult) -> None:
     excerpt = format_excerpt(result.normalized_text or text_for_excerpt)
     print(
@@ -603,14 +591,12 @@ def log_decision(action: str, file_path: Path, block_label: str, text_for_excerp
     )
 
 
-
 def rebuild_text(blocks: Iterable[Block]) -> str:
     pieces: list[str] = []
     for block in blocks:
         pieces.extend(block.header)
         pieces.extend(block.content)
     return "".join(pieces)
-
 
 
 def analyze_by_line(line: str, detectors: HungarianDetectors, threshold: float) -> tuple[bool, AnalysisResult]:
@@ -645,7 +631,6 @@ def analyze_by_line(line: str, detectors: HungarianDetectors, threshold: float) 
 
     result = analyze_text(stripped_payload, detectors, threshold)
     return result.keep, result
-
 
 
 def process_file(path: Path, out_path: Path, detectors: HungarianDetectors, threshold: float, show_kept: bool) -> tuple[int, int]:
@@ -702,7 +687,6 @@ def process_file(path: Path, out_path: Path, detectors: HungarianDetectors, thre
     return checked_count, removed_count
 
 
-
 def main() -> int:
     args = parse_args()
 
@@ -734,10 +718,17 @@ def main() -> int:
 
     total_checked = 0
     total_removed = 0
+    total_skipped = 0
 
     for in_file in txt_files:
         rel = in_file.relative_to(input_dir)
         out_file = output_dir / rel
+
+        if out_file.exists():
+            print(f"[SKIP] Már létezik az outputban, kihagyva: {out_file}")
+            total_skipped += 1
+            continue
+
         checked, removed = process_file(
             path=in_file,
             out_path=out_file,
@@ -749,7 +740,9 @@ def main() -> int:
         total_removed += removed
 
     print("-" * 80)
-    print(f"Feldolgozott fájlok: {len(txt_files)}")
+    print(f"Talált input fájlok: {len(txt_files)}")
+    print(f"Kihagyott fájlok: {total_skipped}")
+    print(f"Feldolgozott fájlok: {len(txt_files) - total_skipped}")
     print(f"Ellenőrzött body/comment/post_title blokkok: {total_checked}")
     print(f"Törölt blokkok: {total_removed}")
     print(f"Megtartott blokkok: {total_checked - total_removed}")
