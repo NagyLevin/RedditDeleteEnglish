@@ -2,20 +2,17 @@
 # -*- coding: utf-8 -*-
 
 import os
-import re
 import json
 import argparse
 from datetime import datetime
 from pathlib import Path
 
 
-def current_iso_datetime() -> str:
+def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
 def detect_language(text: str) -> str:
-    # Egyszerű alapértelmezés: magyar
-    # Később bővíthető, ha kell
     return "hu"
 
 
@@ -31,12 +28,29 @@ def make_author(username: str) -> list:
 def normalize_subreddit(value: str) -> str:
     value = (value or "").strip()
 
-    # Speciális eset: r/u_Kaiokensanpaida -> u/Kaiokensanpaida
-    m = re.fullmatch(r"r/u_(.+)", value, flags=re.IGNORECASE)
-    if m:
-        return f"u/{m.group(1)}"
-
+    # pl. r/u_Kaiokensanpaida -> u/Kaiokensanpaida
+    if value.startswith("r/u_"):
+        return "u/" + value[len("r/u_"):]
     return value
+
+
+def extract_username_from_filename(filename: str) -> str:
+    stem = Path(filename).stem
+
+    if stem.endswith("_chats"):
+        return stem[:-6]
+    if stem.endswith("_posts"):
+        return stem[:-6]
+
+    return stem
+
+
+def prettify_username(username: str) -> str:
+    special = {
+        "izzystraveldiaries": "izzystraveldiaries",
+        "kaiokensanpaida": "Kaiokensanpaida",
+    }
+    return special.get(username.lower(), username)
 
 
 def base_post_object() -> dict:
@@ -54,7 +68,7 @@ def base_post_object() -> dict:
         "language": "hu",
         "tags": [],
         "rights": None,
-        "date_modified": current_iso_datetime(),
+        "date_modified": now_iso(),
         "extra": {},
         "origin": "reddit"
     }
@@ -73,231 +87,220 @@ def base_comment_object() -> dict:
     }
 
 
-def extract_username_from_filename(filename: str) -> str:
-    name = Path(filename).stem
+def strip_common_indent(lines: list[str]) -> str:
+    # szélső üres sorok levágása
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
 
-    # izzystraveldiaries_chats -> izzystraveldiaries
-    if name.endswith("_chats"):
-        return name[:-6]
+    if not lines:
+        return ""
 
-    # kaiokensanpaida_posts -> kaiokensanpaida
-    if name.endswith("_posts"):
-        return name[:-6]
+    min_indent = None
+    for line in lines:
+        if line.strip():
+            leading = len(line) - len(line.lstrip(" "))
+            if min_indent is None or leading < min_indent:
+                min_indent = leading
 
-    return name
+    if min_indent is None:
+        min_indent = 0
+
+    normalized = []
+    for line in lines:
+        if line.strip():
+            normalized.append(line[min_indent:])
+        else:
+            normalized.append("")
+
+    return "\n".join(normalized).strip()
 
 
-def prettify_username(username: str) -> str:
-    # Speciális mapping az általad kért formákhoz
-    special = {
-        "izzystraveldiaries": "izzystraveldiaries",
-        "kaiokensanpaida": "Kaiokensanpaida"
+def split_top_level_blocks(text: str, marker: str) -> list[list[str]]:
+    """
+    marker = "Comment:" vagy "Post:"
+    A fájlt top-level blokkokra bontja.
+    Csak a sor elején álló marker számít új blokknak.
+    """
+    lines = text.splitlines()
+    blocks = []
+    current = None
+
+    for line in lines:
+        if line.strip() == marker:
+            if current:
+                blocks.append(current)
+            current = [line]
+        else:
+            if current is not None:
+                current.append(line)
+
+    if current:
+        blocks.append(current)
+
+    return blocks
+
+
+def detect_file_type(text: str, filename: str) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return "unknown"
+
+    has_comment_marker = "\nComment:" in "\n" + stripped or stripped.startswith("Comment:")
+    has_post_marker = "\nPost:" in "\n" + stripped or stripped.startswith("Post:")
+    has_by_lines = "\nby " in "\n" + stripped or stripped.startswith("by ")
+
+    # 1) csak kommentek
+    if has_comment_marker and not has_post_marker:
+        return "comment_only"
+
+    # 2) posztok kommentekkel
+    if has_post_marker and has_by_lines:
+        return "post_with_comments"
+
+    # 3) csak posztok
+    if has_post_marker:
+        return "post_only"
+
+    # fallback fájlnév alapján
+    lower_name = filename.lower()
+    if lower_name.endswith("_chats.txt"):
+        return "comment_only"
+    if lower_name.endswith("_posts.txt"):
+        return "post_only"
+
+    return "unknown"
+
+
+def parse_comment_block(block_lines: list[str], username: str) -> dict | None:
+    """
+    Formátum:
+    Comment:
+      subreddit: r/...
+      body:
+        szöveg...
+    """
+    subreddit = None
+    body_lines = []
+    in_body = False
+
+    for i, raw in enumerate(block_lines[1:], start=1):  # az első sor maga a Comment:
+        stripped = raw.strip()
+
+        if stripped.startswith("subreddit:"):
+            subreddit = stripped.split(":", 1)[1].strip()
+            continue
+
+        if stripped == "body:":
+            in_body = True
+            continue
+
+        if in_body:
+            body_lines.append(raw)
+
+    body = strip_common_indent(body_lines)
+
+    if subreddit is None and not body:
+        return None
+
+    obj = base_post_object()
+    obj["title"] = ""
+    obj["authors"] = make_author(username)
+    obj["data"] = body
+    obj["comments"] = []
+    obj["language"] = detect_language(body)
+    obj["extra"] = {
+        "source_type": "comment",
+        "subreddit": normalize_subreddit(subreddit or "")
     }
-    return special.get(username.lower(), username)
+
+    return obj
 
 
 def parse_comment_only_file(text: str, filename: str) -> list:
     username = prettify_username(extract_username_from_filename(filename))
-
-    pattern = re.compile(
-        r"Comment:\s*\n\s*subreddit:\s*(?P<subreddit>.+?)\s*\n\s*body:\s*\n(?P<body>(?:\s+.*(?:\n|$))+)",
-        re.MULTILINE
-    )
-
+    blocks = split_top_level_blocks(text, "Comment:")
     results = []
 
-    for match in pattern.finditer(text):
-        subreddit = match.group("subreddit").strip()
-        body = dedent_block(match.group("body")).strip()
-
-        obj = base_post_object()
-        obj["title"] = ""
-        obj["authors"] = make_author(username)
-        obj["data"] = body
-        obj["comments"] = []
-        obj["language"] = detect_language(body)
-        obj["extra"] = {
-            "source_type": "comment",
-            "subreddit": normalize_subreddit(subreddit)
-        }
-
-        results.append(obj)
+    for block in blocks:
+        obj = parse_comment_block(block, username)
+        if obj is not None:
+            results.append(obj)
 
     return results
 
 
-def parse_post_only_file(text: str, filename: str) -> list:
-    username = prettify_username(extract_username_from_filename(filename))
-
-    # Post-only formátum:
-    # Post:
-    #   subreddit: ...
-    #   title: ...
-    #   body:
-    #     ...
-    pattern = re.compile(
-        r"Post:\s*\n"
-        r"\s*subreddit:\s*(?P<subreddit>.+?)\s*\n"
-        r"\s*title:\s*(?P<title>.+?)\s*\n"
-        r"\s*body:\s*\n"
-        r"(?P<body>(?:\s+.*(?:\n|$))+?)(?=(?:\nPost:|\Z))",
-        re.MULTILINE
-    )
-
-    results = []
-
-    for match in pattern.finditer(text):
-        subreddit = match.group("subreddit").strip()
-        title = match.group("title").strip()
-        body = dedent_block(match.group("body")).strip()
-
-        obj = base_post_object()
-        obj["title"] = title
-        obj["authors"] = make_author(username)
-        obj["data"] = body
-        obj["comments"] = []
-        obj["language"] = detect_language(f"{title}\n{body}")
-        obj["extra"] = {
-            "source_type": "post",
-            "subreddit": normalize_subreddit(subreddit)
-        }
-
-        results.append(obj)
-
-    return results
-
-
-def parse_post_with_comments_file(text: str, filename: str) -> list:
-    # Itt a tényleges author a blokkból jön: "by USER: Title"
-    # Egy post blokk végét a következő "Post:" vagy EOF jelzi
-    post_blocks = re.findall(
-        r"Post:\s*\n(?P<content>.*?)(?=\nPost:\s*\n|\Z)",
-        text,
-        flags=re.DOTALL
-    )
-
-    results = []
-
-    for block in post_blocks:
-        parsed = parse_single_post_with_comments_block(block, filename)
-        if parsed is not None:
-            results.append(parsed)
-
-    return results
-
-
-def parse_single_post_with_comments_block(block: str, filename: str) -> dict | None:
-    lines = block.splitlines()
-
-    author = ""
+def parse_post_only_block(block_lines: list[str], username: str) -> dict | None:
+    """
+    Formátum:
+    Post:
+      subreddit: ...
+      title: ...
+      body:
+        ...
+    """
+    subreddit = None
     title = ""
     body_lines = []
-    comments = []
+    in_body = False
 
-    current_mode = None
-    current_comment_author = None
-    current_comment_lines = []
+    for raw in block_lines[1:]:
+        stripped = raw.strip()
 
-    visited_value = None
-
-    for raw_line in lines:
-        line = raw_line.rstrip("\n")
-
-        if not line.strip():
-            if current_mode == "body":
-                body_lines.append("")
-            elif current_mode == "comment" and current_comment_author is not None:
-                current_comment_lines.append("")
+        if stripped.startswith("subreddit:"):
+            subreddit = stripped.split(":", 1)[1].strip()
             continue
 
-        stripped = line.strip()
-
-        # Példák:
-        # by Rude_Ant_9007: Kávé mellett munka?
-        # by ahh_szellem: Where to buy good Christmas stocking?
-        if stripped.startswith("by "):
-            m = re.match(r"by\s+([^:]+):\s*(.*)", stripped)
-            if m:
-                author = m.group(1).strip()
-                title = m.group(2).strip()
-                current_mode = None
-                continue
-
-        # opcionális visited sor, ha lenne
-        if stripped.lower().startswith("visited:"):
-            visited_value = stripped.split(":", 1)[1].strip()
+        if stripped.startswith("title:"):
+            title = stripped.split(":", 1)[1].strip()
             continue
 
-        if stripped.startswith("body:"):
-            # ha épp kommentet gyűjtöttünk, zárjuk le
-            if current_mode == "comment" and current_comment_author is not None:
-                comments.append(build_comment(current_comment_author, "\n".join(current_comment_lines).strip()))
-                current_comment_author = None
-                current_comment_lines = []
-            current_mode = "body"
+        if stripped == "body:":
+            in_body = True
             continue
 
-        if stripped.startswith("comment:"):
-            # ha előző komment volt nyitva, zárjuk le
-            if current_mode == "comment" and current_comment_author is not None:
-                comments.append(build_comment(current_comment_author, "\n".join(current_comment_lines).strip()))
-                current_comment_author = None
-                current_comment_lines = []
+        if in_body:
+            body_lines.append(raw)
 
-            current_mode = "comment"
-            continue
+    body = strip_common_indent(body_lines)
 
-        if current_mode == "comment":
-            # sor mintája: username: szöveg
-            if current_comment_author is None:
-                m = re.match(r"\s*([^:]+):\s*(.*)", line)
-                if m:
-                    current_comment_author = m.group(1).strip()
-                    first_text = m.group(2).strip()
-                    current_comment_lines = [first_text] if first_text else []
-                else:
-                    # ha nincs author-forma, akkor unknown
-                    current_comment_author = "unknown"
-                    current_comment_lines = [stripped]
-            else:
-                current_comment_lines.append(stripped)
-
-        elif current_mode == "body":
-            body_lines.append(stripped)
-
-    # utolsó nyitott komment lezárása
-    if current_mode == "comment" and current_comment_author is not None:
-        comments.append(build_comment(current_comment_author, "\n".join(current_comment_lines).strip()))
-
-    # Ha se author, se title, se body nincs, akkor ezt a blokkot eldobjuk
-    body = "\n".join(body_lines).strip()
-    if not author and not title and not body and not comments:
+    if subreddit is None and not title and not body:
         return None
 
     obj = base_post_object()
     obj["title"] = title
-    obj["authors"] = make_author(author if author else prettify_username(extract_username_from_filename(filename)))
+    obj["authors"] = make_author(username)
     obj["data"] = body
-    obj["comments"] = comments
-    obj["language"] = detect_language(f"{title}\n{body}")
-
-    extra = {
-        "source_type": "post_with_comments",
-        "subreddit": infer_subreddit_from_filename(filename)
+    obj["comments"] = []
+    obj["language"] = detect_language(title + "\n" + body)
+    obj["extra"] = {
+        "source_type": "post",
+        "subreddit": normalize_subreddit(subreddit or "")
     }
-    if visited_value:
-        extra["visited"] = visited_value
 
-    obj["extra"] = extra
     return obj
+
+
+def parse_post_only_file(text: str, filename: str) -> list:
+    username = prettify_username(extract_username_from_filename(filename))
+    blocks = split_top_level_blocks(text, "Post:")
+    results = []
+
+    for block in blocks:
+        obj = parse_post_only_block(block, username)
+        if obj is not None:
+            results.append(obj)
+
+    return results
 
 
 def build_comment(author: str, text: str) -> dict:
     c = base_comment_object()
-    c["data"] = text
+    c["data"] = text.strip()
     c["language"] = detect_language(text)
     c["extra"] = {
-        "author": author
+        "author": author.strip()
     }
     return c
 
@@ -310,95 +313,173 @@ def infer_subreddit_from_filename(filename: str) -> str:
 
     username = extract_username_from_filename(filename)
     if username:
-        return normalize_subreddit(f"u/{prettify_username(username)}")
+        pretty = prettify_username(username)
+        return normalize_subreddit(f"u/{pretty}")
 
     return ""
 
 
-def dedent_block(text: str) -> str:
-    lines = text.splitlines()
+def parse_post_with_comments_block(block_lines: list[str], filename: str) -> dict | None:
+    """
+    Formátum kb:
+    Post:
+    by USER: Cím
+      body:
+        ...
+      comment:
+        USER2: ...
+        ...
+      comment:
+        USER3: ...
+    """
 
-    # Eldobjuk a teljesen üres szélső sorokat
-    while lines and not lines[0].strip():
-        lines.pop(0)
-    while lines and not lines[-1].strip():
-        lines.pop()
+    title = ""
+    author = ""
+    body_lines = []
+    comments = []
+    visited = None
 
-    if not lines:
-        return ""
+    mode = None  # None | "body" | "comment"
+    current_comment_author = None
+    current_comment_lines = []
 
-    indents = []
-    for line in lines:
-        if line.strip():
-            indents.append(len(line) - len(line.lstrip(" ")))
+    def flush_comment():
+        nonlocal current_comment_author, current_comment_lines, comments
+        if current_comment_author is not None:
+            text = "\n".join(current_comment_lines).strip()
+            comments.append(build_comment(current_comment_author, text))
+            current_comment_author = None
+            current_comment_lines = []
 
-    min_indent = min(indents) if indents else 0
-    return "\n".join(line[min_indent:] if len(line) >= min_indent else line for line in lines)
+    for raw in block_lines[1:]:  # első sor a Post:
+        stripped = raw.strip()
+
+        if not stripped:
+            if mode == "body":
+                body_lines.append("")
+            elif mode == "comment" and current_comment_author is not None:
+                current_comment_lines.append("")
+            continue
+
+        if stripped.startswith("by "):
+            # pl. by Rude_Ant_9007: Kávé mellett munka?
+            rest = stripped[3:]
+            if ":" in rest:
+                author_part, title_part = rest.split(":", 1)
+                author = author_part.strip()
+                title = title_part.strip()
+            else:
+                author = rest.strip()
+                title = ""
+            mode = None
+            continue
+
+        if stripped.lower().startswith("visited:"):
+            visited = stripped.split(":", 1)[1].strip()
+            continue
+
+        if stripped == "body:":
+            flush_comment()
+            mode = "body"
+            continue
+
+        if stripped == "comment:":
+            flush_comment()
+            mode = "comment"
+            continue
+
+        if mode == "body":
+            body_lines.append(raw)
+            continue
+
+        if mode == "comment":
+            if current_comment_author is None:
+                # első komment sor: username: szöveg
+                if ":" in stripped:
+                    c_author, c_text = stripped.split(":", 1)
+                    current_comment_author = c_author.strip()
+                    first_text = c_text.strip()
+                    current_comment_lines = [first_text] if first_text else []
+                else:
+                    current_comment_author = "unknown"
+                    current_comment_lines = [stripped]
+            else:
+                current_comment_lines.append(raw)
+
+    flush_comment()
+
+    body = strip_common_indent(body_lines)
+
+    if not author and not title and not body and not comments:
+        return None
+
+    obj = base_post_object()
+    obj["title"] = title
+    obj["authors"] = make_author(author if author else prettify_username(extract_username_from_filename(filename)))
+    obj["data"] = body
+    obj["comments"] = comments
+    obj["language"] = detect_language(title + "\n" + body)
+
+    extra = {
+        "source_type": "post_with_comments",
+        "subreddit": infer_subreddit_from_filename(filename)
+    }
+    if visited:
+        extra["visited"] = visited
+
+    obj["extra"] = extra
+    return obj
 
 
-def detect_file_type(text: str, filename: str) -> str:
-    stripped = text.strip()
+def parse_post_with_comments_file(text: str, filename: str) -> list:
+    blocks = split_top_level_blocks(text, "Post:")
+    results = []
 
-    if not stripped:
-        return "unknown"
+    for block in blocks:
+        obj = parse_post_with_comments_block(block, filename)
+        if obj is not None:
+            results.append(obj)
 
-    # csak kommentek
-    if "Comment:" in stripped and "Post:" not in stripped and "comment:" not in stripped:
-        return "comment_only"
-
-    # csak posztok
-    if "Post:" in stripped and "subreddit:" in stripped and "title:" in stripped and "by " not in stripped:
-        return "post_only"
-
-    # posztok kommentekkel
-    if "Post:" in stripped and "by " in stripped:
-        return "post_with_comments"
-
-    # fájlnév alapján fallback
-    lower_name = filename.lower()
-    if lower_name.endswith("_chats.txt"):
-        return "comment_only"
-    if lower_name.endswith("_posts.txt"):
-        return "post_only"
-
-    return "unknown"
+    return results
 
 
 def process_file(input_path: Path) -> list:
-    with input_path.open("r", encoding="utf-8") as f:
-        text = f.read()
-
+    text = input_path.read_text(encoding="utf-8")
     file_type = detect_file_type(text, input_path.name)
 
     if file_type == "comment_only":
         return parse_comment_only_file(text, input_path.name)
-    elif file_type == "post_only":
+
+    if file_type == "post_only":
         return parse_post_only_file(text, input_path.name)
-    elif file_type == "post_with_comments":
+
+    if file_type == "post_with_comments":
         return parse_post_with_comments_file(text, input_path.name)
-    else:
-        print(f"[WARN] Ismeretlen formátum, kihagyva: {input_path.name}")
-        return []
+
+    print(f"[WARN] Ismeretlen formátum, kihagyva: {input_path.name}")
+    return []
 
 
 def save_json(output_path: Path, data: list) -> None:
-    with output_path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    output_path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Reddit-szerű txt fájlok konvertálása egységes forum_post JSON sémára."
+        description="Reddit jellegű txt fájlok konvertálása egységes forum_post JSON formátumba."
     )
     parser.add_argument(
         "--input",
         required=True,
-        help="Bemeneti mappa elérési útja"
+        help="Bemeneti mappa"
     )
     parser.add_argument(
         "--output",
         required=True,
-        help="Kimeneti mappa elérési útja"
+        help="Kimeneti mappa"
     )
 
     args = parser.parse_args()
@@ -412,29 +493,28 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     txt_files = sorted(input_dir.glob("*.txt"))
+
     if not txt_files:
         print("Nincs feldolgozható .txt fájl a bemeneti mappában.")
         return
 
     print(f"Összesen {len(txt_files)} fájl feldolgozása indul...")
 
-    for index, input_file in enumerate(txt_files, start=1):
-        print(f"[{index}/{len(txt_files)}] Feldolgozás: {input_file.name}")
+    for idx, input_file in enumerate(txt_files, start=1):
+        print(f"[{idx}/{len(txt_files)}] Feldolgozás: {input_file.name}")
 
         try:
             converted = process_file(input_file)
-
             output_file = output_dir / f"{input_file.stem}.json"
             save_json(output_file, converted)
-
-            print(f"    Kész: {output_file.name} ({len(converted)} rekord)")
+            print(f"    Kész: {output_file.name} | rekordok száma: {len(converted)}")
         except Exception as e:
-            print(f"    HIBA {input_file.name} feldolgozása közben: {e}")
+            print(f"    HIBA: {input_file.name} -> {e}")
 
     print("Feldolgozás befejezve.")
 
 
 if __name__ == "__main__":
     main()
-
+    
 #python jsonconverter.py --input ./input --output ./output

@@ -7,7 +7,7 @@ A_Viktor.json	459
 AlsoPirosAzt.json	19
 Andris.json	518
 Arad.json	0
-AusztraliaMagyarul.json	0
+AusztraliaMagyarul.json	15
 BALsors.json	158
 Balaton.json	1338
 Balatonlelle.json	30
@@ -18,7 +18,7 @@ BeyondSelfRPG.json	39
 Biciklisek.json	162234
 BikaBody.json	0
 BitcoinHU.json	0
-BitcoinHungary.json	0
+BitcoinHungary.json	127
 BlathyMemes20k20.json	36
 BolyaiTGK.json	56
 Boronkay.json	99
@@ -64,8 +64,8 @@ Hodmezovasarhely.json	101643
 HunNews.json	2219
 HunPub.json	179
 Hunblr.json	17
-HungarianAirsoft.json	0
-HungarianPoems.json	0
+HungarianAirsoft.json	25
+HungarianPoems.json	29
 HungarianReality.json	321
 Hungarian_Arts.json	93
 Hunpolitics.json	0
@@ -95,14 +95,14 @@ Lovassy.json	4946
 MCCJunior.json	37
 MagyarAnime.json	4894
 MagyarMemek.json	2164
-Magyar_CoD_gang.json	0
+Magyar_CoD_gang.json	52
 Magyarorszag.json	45
 MappingMemes.json	206
 MemeRadiyo.json	44
 MindentBele.json	7
 Miskolc.json	193135
 MoralisFoleny.json	270
-Napiszar.json	0
+Napiszar.json	15
 NemHircsarda.json	11754
 Nevemlaci_Tv.json	0
 NorbiPeti.json	0
@@ -129,8 +129,8 @@ Tardoskedd.json	177
 TarguMuresMarosvasarh.json	4
 TeamUndefiN3D.json	0
 TermeszetesenSzignum.json	169
-TerrariaHungary.json	0
-Tescommunism.json	0
+TerrariaHungary.json	91
+Tescommunism.json	3
 ThatSchool.json	30
 The_Puzser.json	59
 Tician.json	7
@@ -171,7 +171,7 @@ askhungary.json	2910551
 atarsasag.json	180
 atessz_.json	4
 athoszkomedia.json	345
-ausztraliamagyarul.json	0
+ausztraliamagyarul.json	15
 baja.json	0
 balaton.json	1226
 balatonlelle.json	30
@@ -194,8 +194,8 @@ bolyaitgk.json	56
 boronkay.json	99
 brawlstarshungary.json	23
 breking_nyuz.json	3894
-brendon_lakatos.json	0
-bturbo.json	0
+brendon_lakatos.json	10
+bturbo.json	4
 buda.json	0
 budaors.json	485
 budapest.json	636668
@@ -218,7 +218,7 @@ csub_azurmedve.json	39
 csufcsuf.json	23021
 cytmean.json	0
 czuczorkolesz.json	51
-d2jsphunsub.json	0
+d2jsphunsub.json	102
 dabasvaros.json	158
 dagadtmacskak.json	451799
 debrecen.json	677492
@@ -294,7 +294,7 @@ gyikidiotak.json	1621
 gyongyos.json	0
 gyonkcity.json	98
 gyor.json	410046
-gyula.json	0
+gyula.json	14
 hagymautalok.json	249
 hajduboszormeny.json	75
 hajdunanas.json	60
@@ -311,9 +311,9 @@ horthy_katonai.json	102
 hu.json	54062
 hun_photography.json	0
 hun_tech.json	28
-hunfnbrclans.json	0
+hunfnbrclans.json	32
 hungarianFitness.json	1018
-hungarianpoems.json	0
+hungarianpoems.json	29
 hungarianrap.json	6561
 hungarianreality.json	321
 hungariy2.json	277
@@ -372,7 +372,7 @@ kibeszelo_show.json	1024417
 kiflik.json	536
 kiskun.json	23
 kiskunfelegyhaza.json	287
-kiszamolo.json	3501677
+kiszamolo.json	3501617
 kocka.json	325
 kocsma.json	121
 kolozsvar.json	845
@@ -411,7 +411,7 @@ madarasteszko.json	69
 maggyar.json	0
 magyar.json	405324
 magyarTuraBazis.json	1722
-magyar_cod_gang.json	0
+magyar_cod_gang.json	52
 magyar_politika.json	37626
 magyaranime.json	4758
 magyarfoci.json	2829
@@ -430,12 +430,12 @@ maygar.json	95738
 meetuphungary.json	1728
 memeradiyo.json	44
 memeverseny2020.json	202
-mgabor.json	0
+mgabor.json	11
 microtonal.json	0
 micsinalszgru.json	112
 mikronovella.json	11008
 mindentbele.json	7
-mineralhuntershungary.json	0
+mineralhuntershungary.json	1242
 mingmoments.json	0
 mirrorturning.json	40
 miskolc.json	158837
@@ -447,7 +447,7 @@ mspaintmuveszek.json	22
 muegyetem.json	47
 muveszet.json	18438
 nagykanizsa.json	135
-napiszar.json	0
+napiszar.json	15
 narancstetvesesdugo.json	0
 negynegynegy.json	0
 nemhircsarda.json	14440
@@ -513,7 +513,7 @@ speedzone.json	0
 sporoltam1kattintast.json	4242
 starwarshungary.json	124
 storiesheaven.json	0
-subredditemen.json	0
+subredditemen.json	111
 suli.json	0
 sutesfozes.json	458772
 szaban.json	37
@@ -545,7 +545,7 @@ tatabanya.json	44
 technippy.json	70
 telex.json	29111
 termeszetesenszignum.json	169
-terrariahungary.json	0
+terrariahungary.json	91
 tetovaltak.json	16
 the_puzser.json	59
 thehu.json	0
@@ -580,7 +580,7 @@ volutedberet.json	0
 vonatok.json	7310
 walrusz.json	6352
 warthunderhungary.json	88
-widaczabory.json	0
+widaczabory.json	9
 yeahunter.json	14984
 youtubehun.json	0
 youtubekommentek.json	281
@@ -589,4 +589,4 @@ zsido.json	6842
 zuhanygondolatok.json	358
 
 
-szum:	60341467
+szum:	60343501
